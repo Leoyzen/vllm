@@ -223,6 +223,7 @@ from vllm.config import (
     ModelConfig,
     VllmConfig,
     get_current_vllm_config,
+    get_current_vllm_config_or_none,
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import (
@@ -289,7 +290,10 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.dcp import MLADCPManager
+from vllm.v1.attention.ops.dcp import (
+    MLADCPManager,
+    ensure_dcp_a2a_backend,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
@@ -605,6 +609,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
 
         self.use_sparse = use_sparse
+
+        _vllm_config = get_current_vllm_config_or_none()
+        self.dcp_a2a = (
+            _vllm_config is not None
+            and _vllm_config.parallel_config.decode_context_parallel_size > 1
+            and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
+        )
+        if self.dcp_a2a:
+            assert _vllm_config is not None
+            ensure_dcp_a2a_backend(_vllm_config)
 
         self.dcp_manager: MLADCPManager | None = None
         if self.impl.dcp_world_size > 1:

@@ -78,6 +78,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
+    ensure_dcp_a2a_backend,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
@@ -748,6 +749,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.dcp_a2a = (
             self.use_dcp and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
+        if self.dcp_a2a:
+            ensure_dcp_a2a_backend(vllm_config)
 
         # Compatible with models with non-uniform per-layer head counts.
         self.num_qo_heads = get_num_attention_heads_from_layers(
@@ -1827,6 +1830,8 @@ class FlashInferImpl(AttentionImpl):
             and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
         if dcp_a2a:
+            assert vllm_config is not None
+            ensure_dcp_a2a_backend(vllm_config)
             self.dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)

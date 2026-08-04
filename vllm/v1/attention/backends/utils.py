@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -7,8 +8,10 @@ from dataclasses import dataclass, field, fields, make_dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
     Protocol,
     cast,
+    get_args,
 )
 
 import numpy as np
@@ -43,6 +46,49 @@ from vllm.v1.attention.backend import (
 logger = init_logger(__name__)
 
 PAD_SLOT_ID = -1
+
+KVCacheLayoutType = Literal["NHD", "HND"]
+
+_KV_CACHE_LAYOUT_OVERRIDE: KVCacheLayoutType | None = None
+
+
+def is_valid_kv_cache_layout(value: str) -> bool:
+    return value in get_args(KVCacheLayoutType)
+
+
+@functools.lru_cache
+def get_kv_cache_layout() -> str:
+    # Format specified by the code.
+    global _KV_CACHE_LAYOUT_OVERRIDE
+
+    if _KV_CACHE_LAYOUT_OVERRIDE is not None:
+        logger.debug_once(
+            "`_KV_CACHE_LAYOUT_OVERRIDE` variable detected. "
+            "Setting KV cache layout to %s.",
+            _KV_CACHE_LAYOUT_OVERRIDE,
+        )
+        return _KV_CACHE_LAYOUT_OVERRIDE
+
+    # Format specified by the user.
+    cache_layout = envs.VLLM_KV_CACHE_LAYOUT
+    # When neither the user nor the override specified a layout, get default
+    if cache_layout is None:
+        return get_kv_connector_cache_layout()
+    assert is_valid_kv_cache_layout(cache_layout)
+    logger.info_once(
+        "`VLLM_KV_CACHE_LAYOUT` environment variable "
+        "detected. Setting KV cache layout to %s.",
+        cache_layout,
+    )
+    return cache_layout
+
+
+def set_kv_cache_layout(cache_layout: KVCacheLayoutType | None) -> None:
+    global _KV_CACHE_LAYOUT_OVERRIDE
+    _KV_CACHE_LAYOUT_OVERRIDE = cache_layout
+    get_kv_cache_layout.cache_clear()
+
+
 NULL_BLOCK_ID = 0
 
 _LN_2 = math.log(2.0)
