@@ -1379,14 +1379,24 @@ class MooncakeStoreWorker:
         groups = list(kv_cache_config.kv_cache_groups)
         if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
             g = groups[0]
-            groups = [
-                dataclasses.replace(
-                    g,
-                    kv_cache_spec=dataclasses.replace(
-                        g.kv_cache_spec, block_size=self.block_size
-                    ),
+            outer_spec = g.kv_cache_spec
+            kv_spec: KVCacheSpec
+            if isinstance(outer_spec, UniformTypeKVCacheSpecs):
+                # ``UniformTypeKVCacheSpecs`` wraps heterogeneous inner specs
+                # (e.g. sparse-indexer uint8 + MLA fp8_ds_mla). The coordinator
+                # unwraps the spec, so every inner spec must be scaled too;
+                # scaling only the outer wrapper leaves the inner block_size
+                # misaligned with ``hash_block_size``.
+                inner_specs = {
+                    name: dataclasses.replace(spec, block_size=self.block_size)
+                    for name, spec in outer_spec.kv_cache_specs.items()
+                }
+                kv_spec = UniformTypeKVCacheSpecs(
+                    block_size=self.block_size, kv_cache_specs=inner_specs
                 )
-            ]
+            else:
+                kv_spec = dataclasses.replace(outer_spec, block_size=self.block_size)
+            groups = [dataclasses.replace(g, kv_cache_spec=kv_spec)]
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
