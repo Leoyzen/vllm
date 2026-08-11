@@ -849,10 +849,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         assert attn_metadata.fp8_extra_metadata is not None
         assert isinstance(attn_metadata.fp8_extra_metadata, list)
         attn_out = q.new_empty((*q.shape[:-1], 512))
-        if self.need_to_return_lse_for_decode:
-            lse_out = q.new_empty((q.shape[0], q.shape[2]))
-        else:
-            lse_out = None
+        lse_chunks: list[torch.Tensor] = []
 
         for token_slice, fp8_metadata in attn_metadata.fp8_extra_metadata:
             _attn_out, _lse = self._fp8_flash_mla_kernel(
@@ -867,10 +864,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             attn_out[token_slice] = _attn_out.squeeze(0)
             if self.need_to_return_lse_for_decode:
                 # Kernel LSE is (1, H, T_i); the DCP merge consumes (T, H).
-                lse_out[token_slice] = _lse.squeeze(0).transpose(0, 1)
+                lse_chunks.append(_lse.squeeze(0).transpose(0, 1))
 
         if not self.need_to_return_lse_for_decode:
             return attn_out, None
+        lse_out = torch.cat(lse_chunks, dim=0)
 
         # Rows where this rank owns none of the selected tokens (all indices
         # -1) have undefined out/lse; (0, -inf) is the identity element of the
