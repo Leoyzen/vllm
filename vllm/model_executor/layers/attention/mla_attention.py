@@ -586,6 +586,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
 
+        # Project attention output through W_UV before the DCP merge: shrinks
+        # the merge payload from kv_lora_rank to v_head_dim per head.
+        self.W_UV_dcp: torch.Tensor | None = None
+
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
 
         # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported
@@ -935,32 +939,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
                 assert lse is not None
-                if self.dcp_a2a:
-                    attn_out = dcp_a2a_lse_reduce(
-                        attn_out,
-                        lse,
-                        get_dcp_group(),
-                        is_lse_base_on_e=self.impl.lse_base_on_e,
-                    )
-                elif self.use_pcp:
-                    attn_out = cp_lse_ag_out_ar(
-                        attn_out,
-                        lse,
-                        get_dcp_group(),
-                        is_lse_base_on_e=self.impl.lse_base_on_e,
-                    )
-                else:
-                    attn_out = cp_lse_ag_out_rs(
-                        attn_out,
-                        lse,
-                        get_dcp_group(),
-                        is_lse_base_on_e=self.impl.lse_base_on_e,
-                    )
-                if self.use_pcp:
-                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
-
-            # v_up projection
-            self._v_up_proj(attn_out, out=mqa_output_slice)
+            self._dcp_merge_and_v_up_proj(attn_out, lse, mqa_output_slice)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks
@@ -1112,6 +1091,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
                     self.W_UK_T.contiguous(), dim=0
                 )
+            if getattr(self.impl, "dcp_world_size", 1) > 1:
+                # all_gather_into_tensor requires a contiguous input
+                self.W_UV_dcp = get_dcp_group().all_gather(
+                    self.W_UV.contiguous(), dim=0
+                )
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -1140,6 +1124,79 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
+
+    def _dcp_lse_merge(
+        self,
+        attn_out: torch.Tensor,
+        lse: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """LSE-weighted combine of the per-rank attention outputs across the
+        DCP group. The a2a transport can write directly into ``out``."""
+        if self.dcp_a2a:
+            return dcp_a2a_lse_reduce(
+                attn_out,
+                lse,
+                get_dcp_group(),
+                is_lse_base_on_e=self.impl.lse_base_on_e,
+                out=out,
+                valid_counts=getattr(self.impl, "_last_dcp_valid_counts", None),
+            )
+        elif self.use_pcp:
+            attn_out = cp_lse_ag_out_ar(
+                attn_out,
+                lse,
+                get_dcp_group(),
+                is_lse_base_on_e=self.impl.lse_base_on_e,
+            )
+            return finalize_mla_pcp_decode(attn_out, self.num_heads)
+        return cp_lse_ag_out_rs(
+            attn_out,
+            lse,
+            get_dcp_group(),
+            is_lse_base_on_e=self.impl.lse_base_on_e,
+        )
+
+    def _dcp_merge_and_v_up_proj(
+        self,
+        attn_out: torch.Tensor,
+        lse: torch.Tensor | None,
+        out: torch.Tensor,
+    ) -> None:
+        """Combine the decode attention output across DCP ranks (if any) and
+        apply the W_UV up-projection into ``out`` (flattened v_head_dim)."""
+        if (
+            self.impl.dcp_world_size > 1
+            and self.W_UV_dcp is not None
+            and not self.use_pcp
+        ):
+            # Project kv_lora_rank -> v_head_dim BEFORE the merge to shrink the
+            # DCP exchange payload; the LSE-weighted merge commutes with the
+            # linear W_UV projection, so this is exact.
+            assert lse is not None
+            projected = attn_out.new_empty(
+                attn_out.shape[0], attn_out.shape[1], self.v_head_dim
+            )
+            self._v_up_proj_bmm(attn_out, projected, self.W_UV_dcp)
+            out_view = out.view(-1, self.num_heads, self.v_head_dim)
+            merged = self._dcp_lse_merge(projected, lse, out=out_view)
+            if merged is not out_view:
+                out.copy_(merged.reshape(out.shape))
+            return
+
+        # Project after the merge (dcp=1, PCP, or backends without gathered W_UV).
+        if self.impl.dcp_world_size > 1:
+            assert lse is not None
+            attn_out = self._dcp_lse_merge(attn_out, lse, out=None)
+        self._v_up_proj(attn_out, out=out)
+
+    def _v_up_proj_bmm(
+        self, x: torch.Tensor, out: torch.Tensor, w_uv: torch.Tensor
+    ) -> None:
+        num_heads = w_uv.shape[0]
+        x = x.view(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
+        out = out.view(-1, num_heads, self.v_head_dim)
+        torch.bmm(x, w_uv, out=out.transpose(0, 1))
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)
