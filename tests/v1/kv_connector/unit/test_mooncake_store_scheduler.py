@@ -939,3 +939,50 @@ def test_eagle_finished_request_flushes_materialized_prefix():
     assert len(meta.requests) == 1
     assert meta.requests[0].block_hashes == [b"eagle-0"]
     assert meta.requests[0].token_len_chunk == 16
+
+
+def test_eagle_cached_request_empty_block_list_uses_tracker_groups():
+    # Regression: with EAGLE prefix-cache hashing active, a cached (decode)
+    # request whose unfinished-request block list is empty (0 groups, from
+    # update_state_after_alloc when no external tokens were loaded) must not
+    # feed a 0-group block list into RequestTracker.update; the tracker's
+    # group count (fixed at prefill time) is the authoritative shape.
+    scheduler = _make_bare_scheduler()
+    scheduler.use_eagle_prefix_cache_hashing = True
+    token_ids = list(range(32))
+    request = SimpleNamespace(
+        all_token_ids=token_ids,
+        block_hashes=[b"eagle-0"],
+        num_publishable_block_hashes=1,
+        num_output_placeholders=0,
+    )
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=16,
+        allocated_block_ids=([0, 1],),
+        num_saved_tokens=0,
+        token_ids=token_ids[:16],
+        prefill_end_tokens=32,
+    )
+    # Unfinished-request block list is empty (0 groups) because no external
+    # tokens were loaded in update_state_after_alloc.
+    scheduler._unfinished_requests["req-0"] = (request, ())
+    out = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req-0"],
+            new_block_ids=[()],
+            num_computed_tokens=[16],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={"req-0": 1},
+        scheduled_spec_decode_tokens={},
+    )
+
+    # Must not raise "Group count mismatch: tracker has 1 groups, update has 0".
+    meta = scheduler.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    assert scheduler._request_trackers["req-0"].allocated_block_ids == ([0, 1],)
