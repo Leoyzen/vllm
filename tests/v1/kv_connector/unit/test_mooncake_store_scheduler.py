@@ -248,6 +248,37 @@ def test_pending_load_does_not_co_queue_save():
     assert tracker.num_saved_tokens == 0
 
 
+def test_pending_load_miss_truncates_save_to_publishable_hashes():
+    # Regression: a request parked on a pending load can carry a non-zero
+    # kvpool prefix (partial lookup hit) while can_load=False. Under EAGLE
+    # hashing the block hashes are truncated to the publishable boundary, so
+    # the save range must be truncated with them. Passing max_save_tokens=None
+    # left token_len_chunk covering the full kvpool prefix, which trips the
+    # worker's `assert token_len // hash_block_size <= len(block_hashes)`.
+    scheduler = _make_bare_scheduler()
+    scheduler.use_eagle_prefix_cache_hashing = True
+    _make_pending_load_unfinished_request(
+        scheduler,
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+    scheduler._unfinished_requests["req-0"][0].num_publishable_block_hashes = 2
+    scheduler.load_specs["req-0"] = LoadSpec(
+        vllm_cached_tokens=0,
+        kvpool_cached_tokens=48,
+        can_load=False,
+    )
+
+    meta = scheduler.build_connector_meta(_make_pending_load_scheduler_output())
+
+    assert len(meta.requests) == 1
+    req_meta = meta.requests[0]
+    assert req_meta.can_save is True
+    # The coverage invariant the worker enforces must hold: the save range must
+    # not exceed the publishable block-hash boundary.
+    assert (req_meta.token_len_chunk // 16) <= len(req_meta.block_hashes)
+
+
 def _make_resumed_unfinished_request(
     scheduler: MooncakeStoreScheduler,
     *,

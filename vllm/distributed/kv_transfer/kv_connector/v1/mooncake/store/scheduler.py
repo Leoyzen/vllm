@@ -397,7 +397,13 @@ class MooncakeStoreScheduler:
                     block_hashes=self._request_hashes_for_meta(
                         unfinished_req, load_spec
                     ),
-                    max_save_tokens=None,
+                    # When the load did not hit (can_load=False), the block
+                    # hashes are truncated to the publishable boundary, so the
+                    # save range must be truncated with them, matching the
+                    # regular save path. Passing None here lets token_len_chunk
+                    # cover the full prompt while process_tokens asserts
+                    # token_len // hash_block_size <= len(block_hashes).
+                    max_save_tokens=self._max_save_tokens(unfinished_req, load_spec),
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
