@@ -81,10 +81,12 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        use_eagle_prefix_cache_hashing: bool = False,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self.use_eagle_prefix_cache_hashing = use_eagle_prefix_cache_hashing
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
         # of the hash_block_size and the block size of each group.
         assert scheduler_block_size % hash_block_size == 0 and all(
@@ -100,6 +102,7 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            use_eagle_prefix_cache_hashing=use_eagle_prefix_cache_hashing,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -147,7 +150,6 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
-
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
         # 0 = keep only the latest replay boundary; None = dense;
@@ -305,9 +307,8 @@ class KVCacheCoordinator(ABC):
 
         Args:
             request: The request.
-            num_computed_tokens: The total number of tokens
-                that need to be cached
-                (including tokens that are already cached).
+            num_computed_tokens: The total number of tokens that need to be
+                cached, including tokens that are already cached.
         """
         for manager in self.single_type_managers:
             # Only cache tokens with finalized KV. The last num_reprefillable_tokens
@@ -437,6 +438,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        use_eagle_prefix_cache_hashing: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -451,6 +453,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            use_eagle_prefix_cache_hashing=use_eagle_prefix_cache_hashing,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -489,6 +492,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        use_eagle_prefix_cache_hashing: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -503,6 +507,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            use_eagle_prefix_cache_hashing=use_eagle_prefix_cache_hashing,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -532,7 +537,9 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             kv_cache_group_ids=[0],
             block_pool=self.block_pool,
             kv_cache_spec=self.kv_cache_spec,
-            drop_eagle_block=0 in self.eagle_group_ids,
+            drop_eagle_block=(
+                0 in self.eagle_group_ids and not self.use_eagle_prefix_cache_hashing
+            ),
             alignment_tokens=self.block_size,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
@@ -576,6 +583,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        use_eagle_prefix_cache_hashing: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -590,6 +598,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            use_eagle_prefix_cache_hashing=use_eagle_prefix_cache_hashing,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -721,8 +730,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             num_tokens_to_cache = aligned_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
-            # it, so make that lookahead block eligible to be cached.
-            if manager.use_eagle and aligned_num_computed_tokens > 0:
+            # it, so make that lookahead block eligible to be cached. With
+            # EAGLE prefix-cache hashing the lookahead is already accounted for
+            # in the hash publication, so only apply the finalized-KV
+            # adjustment (multi-module MTP re-prefill) when hashing is off.
+            if (
+                manager.use_eagle
+                and not self.use_eagle_prefix_cache_hashing
+                and aligned_num_computed_tokens > 0
+            ):
                 # Only cache tokens with finalized KV. The last
                 # num_reprefillable_tokens tokens can be re-prefilled during
                 # multi-module MTP.
@@ -810,7 +826,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     )
                     continue
 
-                drop_eagle_block = use_eagle and idx not in eagle_verified
+                drop_eagle_block = (
+                    use_eagle
+                    and not self.use_eagle_prefix_cache_hashing
+                    and idx not in eagle_verified
+                )
 
                 _max_length = curr_hit_length
                 # Eagle matches one extra drop unit (one hash unit for
@@ -904,7 +924,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_group_ids=group_ids,
                 block_pool=self.block_pool,
                 kv_cache_spec=spec,
-                drop_eagle_block=use_eagle,
+                drop_eagle_block=(
+                    use_eagle and not self.use_eagle_prefix_cache_hashing
+                ),
                 alignment_tokens=self._cache_hit_alignment_tokens,
             )
             for gid, blks in zip(group_ids, blocks):
@@ -926,7 +948,8 @@ def get_kv_cache_coordinator(
     scheduler_block_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
-    num_prefill_lookahead: int = 0,
+        num_prefill_lookahead: int = 0,
+        use_eagle_prefix_cache_hashing: bool = False,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -941,6 +964,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            use_eagle_prefix_cache_hashing=use_eagle_prefix_cache_hashing,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -956,6 +980,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            use_eagle_prefix_cache_hashing=use_eagle_prefix_cache_hashing,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -970,4 +995,5 @@ def get_kv_cache_coordinator(
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
         num_prefill_lookahead=num_prefill_lookahead,
+        use_eagle_prefix_cache_hashing=use_eagle_prefix_cache_hashing,
     )
