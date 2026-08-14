@@ -855,6 +855,28 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         out.copy_(local_seq_lens)
         return out
 
+    def _expanded_block_table(self, block_table_width: int) -> torch.Tensor:
+        """The expanded-block-table buffer, matched to the runner's actual
+        block-table row length.
+
+        The width precomputed in ``__init__`` can disagree with the block
+        table the runner hands us: ``BlockTable`` scales the per-request
+        block count by ``blocks_per_kv_block`` (kernel-block splitting),
+        pads it for alignment, and under DCP the per-rank block table is
+        further divided by ``decode_context_parallel_size``. A mismatched
+        buffer raises on the variable-length copy. The width is static for
+        a given config + DCP size, so this reallocates at most once, during
+        the first (warmup) build - before CUDA-graph capture, keeping the
+        buffer address stable across capture and replay.
+        """
+        if self.expanded_block_table_buffer.shape[1] != block_table_width:
+            self.expanded_block_table_buffer = torch.zeros(
+                (self.expanded_block_table_buffer.shape[0], block_table_width),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        return self.expanded_block_table_buffer
+
     def _prepare_decode_tensors(
         self,
         seq_lens: torch.Tensor,
@@ -881,18 +903,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and num_decodes * max_decode_len == num_decode_tokens
             ):
                 # Uniform decode lengths with no cudagraph token padding.
+                expanded_block_table = self._expanded_block_table(block_table.shape[1])
                 _PREPARE_UNIFORM_DECODE_KERNEL(
                     seq_lens,
                     self.decode_seq_lens_buffer,
                     block_table,
-                    self.expanded_block_table_buffer,
+                    expanded_block_table,
                     self.decode_lens_buffer,
                     num_decode_tokens,
                     max_decode_len,
                 )
                 self.decode_seq_lens_buffer[num_decode_tokens:] = 0
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
-                block_table = self.expanded_block_table_buffer[:num_decode_tokens]
+                block_table = expanded_block_table[:num_decode_tokens]
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
                 return seq_lens, block_table, decode_lens, num_decode_tokens, False
             else:
@@ -927,16 +950,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
                 # Give each of the flattened entries the same block table row as the
                 # original request.
-                self.expanded_block_table_buffer[:actual_expanded] = (
+                self._expanded_block_table(block_table.shape[1])[:actual_expanded] = (
                     torch.repeat_interleave(
                         block_table, decode_lens, dim=0, output_size=actual_expanded
                     )
                 )
                 if actual_expanded < num_decode_tokens:
-                    self.expanded_block_table_buffer[
+                    self._expanded_block_table(block_table.shape[1])[
                         actual_expanded:num_decode_tokens, 0
                     ] = 0
-                block_table = self.expanded_block_table_buffer[:num_decode_tokens]
+                block_table = self._expanded_block_table(block_table.shape[1])[
+                    :num_decode_tokens
+                ]
 
                 # All reqs now have decode_len=1
                 self.decode_lens_buffer[:num_decode_tokens] = 1
