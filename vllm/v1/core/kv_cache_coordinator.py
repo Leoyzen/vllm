@@ -948,8 +948,8 @@ def get_kv_cache_coordinator(
     scheduler_block_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
-        num_prefill_lookahead: int = 0,
-        use_eagle_prefix_cache_hashing: bool = False,
+    num_prefill_lookahead: int = 0,
+    use_eagle_prefix_cache_hashing: bool = False,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(

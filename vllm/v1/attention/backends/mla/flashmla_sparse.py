@@ -234,7 +234,8 @@ class FlashMLASparseMetadata(AttentionMetadata):
     fp8_use_mixed_batch: bool = False
 
 
-# Maximum tokens per prefill chunk buffer to stay within CUDA grid limits (SM90 Hopper limit)
+# Max tokens per prefill chunk buffer to stay within CUDA grid
+# limits (SM90 Hopper limit).
 MAX_PREFILL_CHUNK_TOKENS = 131072
 
 

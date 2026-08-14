@@ -449,7 +449,8 @@ def validate_parsed_serve_args(args: argparse.Namespace):
                 f"Please set --block-size to 128 or lower."
             )
 
-        # Alert if context length is extremely high when combined with speculative execution
+        # Alert if context length is extremely high when combined with
+        # speculative execution
         max_model_len = getattr(args, "max_model_len", None)
         speculative_config = getattr(args, "speculative_config", None)
         if max_model_len and max_model_len > 128000 and speculative_config:
@@ -457,8 +458,9 @@ def validate_parsed_serve_args(args: argparse.Namespace):
 
             logger = logging.getLogger(__name__)
             logger.warning(
-                "High context length (>128k) combined with speculative decoding "
-                "on DeepSeek. Ensure FlashMLA grid dimensions do not exceed GPU boundaries."
+                "High context length (>128k) combined with speculative "
+                "decoding on DeepSeek. Ensure FlashMLA grid dimensions do not "
+                "exceed GPU boundaries."
             )
 
     if args.data_parallel_multi_port_external_lb:

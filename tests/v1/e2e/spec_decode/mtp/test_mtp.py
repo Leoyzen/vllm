@@ -4,6 +4,7 @@
 from typing import Any
 
 import pytest
+import torch
 
 from tests.models.utils import check_logprobs_close
 from tests.utils import single_gpu_only
@@ -150,6 +151,8 @@ def test_mtp_correctness(
             required_matches=int(0.8 * len(ref_outputs)) + 1,
             context=f"{method} target={model_name}, draft={draft_model}",
         )
+
+
 @single_gpu_only
 def test_qwen3_5_mtp_prefix_cache_reuses_last_safe_block(
     monkeypatch: pytest.MonkeyPatch,

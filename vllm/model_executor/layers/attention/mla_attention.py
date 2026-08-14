@@ -223,6 +223,7 @@ from vllm.config import (
     ModelConfig,
     VllmConfig,
     get_current_vllm_config,
+    get_current_vllm_config_or_none,
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import (
@@ -243,7 +244,6 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
 from vllm.model_executor.layers.attention.pcp import (
-    finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -293,6 +293,8 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.dcp_utils import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
@@ -601,7 +603,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
         self.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
         self.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
-
 
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
 
@@ -948,7 +949,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             self._dcp_merge_and_v_up_proj(attn_out, lse, mqa_output_slice)
-
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks
