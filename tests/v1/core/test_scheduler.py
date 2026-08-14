@@ -3257,6 +3257,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.enable_return_routed_experts = False
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
+    scheduler.use_eagle_prefix_cache_hashing = False
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
 

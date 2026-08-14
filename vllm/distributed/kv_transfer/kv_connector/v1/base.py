@@ -174,6 +174,23 @@ class KVConnectorBase_V1(ABC):
     """
 
     @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """Whether external hits can complete divergent local hybrid hits.
+
+        A capable connector restores lagging recurrent state when the local
+        full-attention group reaches a deeper boundary. Defaults to False.
+        """
+        return False
+
+    @property
+    def supports_eagle_prefix_cache_hashing(self) -> bool:
+        """Whether this engine can use successor-aware EAGLE cache keys.
+
+        Engines sharing a content-addressed cache must make the same choice.
+        """
+        return False
+
+    @property
     def prefer_cross_layer_blocks(self) -> bool:
         """
         Indicates whether this connector prefers KV blocks that hold KV data for all
@@ -211,6 +228,11 @@ class KVConnectorBase_V1(ABC):
             raise ValueError("kv_transfer_config must be set for KVConnectorBase_V1")
         self._kv_cache_config = kv_cache_config
         self._role = role
+        self.use_eagle_prefix_cache_hashing = False
+
+    def set_eagle_prefix_cache_hashing(self, enabled: bool) -> None:
+        """Configure the engine-wide prefix-cache hash protocol."""
+        self.use_eagle_prefix_cache_hashing = enabled
 
     @property
     def role(self) -> KVConnectorRole:

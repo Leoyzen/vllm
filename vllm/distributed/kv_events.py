@@ -76,6 +76,9 @@ class BlockStored(KVCacheEvent):
     locality: str | None = None
     """LOCAL or REMOTE relative to the publisher; None means unspecified."""
 
+    hash_block_size: int | None = None
+    """Hash recurrence granularity when it differs from ``block_size``."""
+
     def __hash__(self) -> int:
         return hash(
             (
@@ -90,6 +93,7 @@ class BlockStored(KVCacheEvent):
                 self.kv_cache_spec_kind,
                 self.kv_cache_spec_sliding_window,
                 self.locality,
+                self.hash_block_size,
             )
         )
 
