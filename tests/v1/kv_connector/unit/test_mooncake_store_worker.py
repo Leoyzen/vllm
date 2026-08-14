@@ -765,7 +765,7 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
     )
     coord = SimpleNamespace(
         lcm_block_size=16,
-        store_mask=lambda token_len, start_token, num_prompt_tokens=None: (
+        store_mask=lambda token_len, start_token, num_prompt_tokens=None, **kwargs: (
             None,
             [True, False],
         ),
@@ -816,7 +816,7 @@ def test_store_sending_thread_prepares_missing_chunks_once_per_group():
     store.batch_put_from_multi_buffers.return_value = [256, 256, 512, 512]
     coord = SimpleNamespace(
         lcm_block_size=16,
-        store_mask=lambda token_len, start_token, num_prompt_tokens=None: (
+        store_mask=lambda token_len, start_token, num_prompt_tokens=None, **kwargs: (
             None,
             None,
         ),
@@ -1939,8 +1939,8 @@ def test_store_sending_thread_only_stores_swa_blocks_in_window():
 
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.side_effect = (
-        lambda keys, addrs, sizes, *_args: [256] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, addrs, sizes, *_args: (
+        [256] * len(keys)
     )
 
     full_spec = FullAttentionSpec(
@@ -2207,6 +2207,7 @@ def _make_bare_worker(
     worker.store.register_buffer.return_value = 0
     worker.kv_role = kv_role
     worker._capacity_only = False
+    worker.use_eagle_prefix_cache_hashing = False
     worker.block_size = block_size
     worker.tp_rank = 0
     worker.enable_kv_events = False

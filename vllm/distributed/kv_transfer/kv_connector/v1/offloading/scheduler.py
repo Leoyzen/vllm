@@ -31,6 +31,7 @@ from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
@@ -99,9 +100,8 @@ class GroupOffloadConfig(NamedTuple):
     # than the MLA full-attention group).
     # None for full-attention groups or when the optimization doesn't apply.
     alignment_chunk_count: int | None = None
-    # True for EAGLE/MTP draft-model attention groups. The trailing chunk
-    # of these groups is volatile and lacks a stable hash, so it must
-    # be excluded from store and load scheduling.
+    # True for EAGLE/MTP draft-model attention groups. Connectors using legacy
+    # hashes exclude their trailing chunk from store and load scheduling.
     is_eagle_group: bool = False
 
 
@@ -111,6 +111,11 @@ def get_sliding_window_size_in_chunks(
     if isinstance(kv_cache_spec, SlidingWindowSpec):
         assert kv_cache_spec.sliding_window > 0
         return cdiv(kv_cache_spec.sliding_window, tokens_per_chunk)
+
+    if isinstance(kv_cache_spec, ChunkedLocalAttentionSpec):
+        # Attention never reaches back past one chunk
+        assert kv_cache_spec.attention_chunk_size > 0
+        return cdiv(kv_cache_spec.attention_chunk_size, tokens_per_chunk)
 
     if isinstance(kv_cache_spec, MambaSpec):
         # Mamba depends on a single state
@@ -226,9 +231,7 @@ class SchedulerOffloadConfig(NamedTuple):
 
         if eagle_groups:
             logger.info(
-                "KV offloading: EAGLE/MTP draft attention groups %s "
-                "detected. The trailing chunk of these groups will be "
-                "excluded from offloading due to volatility.",
+                "KV offloading: EAGLE/MTP draft attention groups %s detected.",
                 sorted(eagle_groups),
             )
 
@@ -274,10 +277,6 @@ class SchedulerOffloadConfig(NamedTuple):
             spec.blocks_per_chunk == 1
             and len(group_block_sizes) == 1
             and has_partial_recurrent_group
-            and not (
-                spec.kv_events_config.enable_kv_cache_events
-                and spec.kv_events_config.self_describing_kv_events
-            )
             and all(
                 config.sliding_window_size_in_chunks is None
                 or config.requires_cow_source
@@ -382,15 +381,15 @@ class RequestOffloadState:
         group_config: "GroupOffloadConfig",
         group_state: RequestGroupState,
         num_offloadable_tokens: int,
+        apply_eagle_drop: bool,
     ) -> int:
         """Number of allocated leading offloaded chunks eligible for store.
 
-        For eagle/MTP groups the volatile trailing chunk of the offloadable
-        range is excluded while decoding: the draft-layer KV of the last
-        accepted position may be rewritten after spec-token rejection. During
-        prefill the trailing chunk is stable (the draft input for a chunk's
-        last position is the next prompt token), so it is stored immediately.
-        The exclusion must be applied consistently everywhere
+        With legacy hashes, the volatile trailing chunk of an EAGLE/MTP group
+        is excluded while decoding: the draft-layer KV of the last accepted
+        position may be rewritten after spec-token rejection. During prefill
+        the trailing chunk is stable, so it is stored immediately. The
+        exclusion must be applied consistently everywhere
         ``next_stored_chunk_idx`` is derived: otherwise the trailing chunk of
         each step is skipped on collection but jumped over by
         ``next_stored_chunk_idx``, so it is never re-considered and a
@@ -398,14 +397,16 @@ class RequestOffloadState:
         """
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
-        if group_config.is_eagle_group and is_decoding:
+        if apply_eagle_drop and group_config.is_eagle_group and is_decoding:
             num_chunks = max(0, num_chunks - 1)
         num_allocated_chunks = (
             len(group_state.block_ids) // self.config.blocks_per_chunk
         )
         return min(num_chunks, num_allocated_chunks)
 
-    def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
+    def advance_stored_idx(
+        self, num_offloadable_tokens: int, apply_eagle_drop: bool
+    ) -> None:
         # max(): at the prefill->decode transition of a chunk-aligned prompt,
         # storable_chunks drops by one (the eagle exclusion kicks in), and the
         # index must not move backwards past already-stored chunks.
@@ -414,7 +415,12 @@ class RequestOffloadState:
         ):
             group_state.next_stored_chunk_idx = max(
                 group_state.next_stored_chunk_idx,
-                self.storable_chunks(group_config, group_state, num_offloadable_tokens),
+                self.storable_chunks(
+                    group_config,
+                    group_state,
+                    num_offloadable_tokens,
+                    apply_eagle_drop,
+                ),
             )
 
     def update_num_hit_chunks(self, num_cached_tokens: int) -> None:
@@ -498,6 +504,7 @@ class OffloadingConnectorScheduler:
         )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
+        self.use_eagle_prefix_cache_hashing = False
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -587,6 +594,14 @@ class OffloadingConnectorScheduler:
         self, req_status: RequestOffloadState, num_computed_tokens: int
     ) -> int:
         num = min(num_computed_tokens, req_status.req.num_tokens)
+        if self.use_eagle_prefix_cache_hashing:
+            # A successor key is safe to expose only after both target and
+            # draft KV have materialized through its boundary.
+            num = min(
+                num,
+                req_status.req.num_publishable_block_hashes
+                * self.config.tokens_per_hash,
+            )
         max_offload_tokens = req_status.max_offload_tokens
         if max_offload_tokens is not None:
             num = min(num, max_offload_tokens)
@@ -718,9 +733,8 @@ class OffloadingConnectorScheduler:
         defer_lookup = False
         lookup_groups = self._lookup_groups
 
-        # Tracks which eagle groups have already popped their volatile trailing chunk
-        # in the current convergence iteration. Reset when a non-eagle group
-        # tightens the hit boundary, requiring a fresh pop.
+        # Tracks which legacy EAGLE groups already popped their volatile tail
+        # in this convergence iteration. A non-EAGLE constraint resets it.
         eagle_verified: set[int] = set()
         while lookup_groups:
             looked_up_sliding_window: bool = False
@@ -738,8 +752,12 @@ class OffloadingConnectorScheduler:
                     len(offload_keys) >= req_status.req.num_tokens // tokens_per_chunk
                 )
 
+                apply_eagle_drop = (
+                    group_config.is_eagle_group
+                    and not self.use_eagle_prefix_cache_hashing
+                )
                 is_eagle_unverified = (
-                    group_config.is_eagle_group and group_idx not in eagle_verified
+                    apply_eagle_drop and group_idx not in eagle_verified
                 )
 
                 # Constrain to a chunk-aligned boundary for this group.
@@ -754,8 +772,8 @@ class OffloadingConnectorScheduler:
                     group_config.sliding_window_size_in_chunks
                 )
 
-                # For eagle groups, query one extra chunk that will be popped.
-                # We only need to increase the query size for sliding window groups.
+                # Legacy EAGLE sliding-window lookup queries one extra chunk
+                # that will be popped.
                 query_max = max_hit_size_tokens
                 if is_eagle_unverified and sliding_window_size_in_chunks is not None:
                     query_max = min(
@@ -808,7 +826,7 @@ class OffloadingConnectorScheduler:
                     return 0
 
                 if new_num_hit_tokens < num_hit_tokens:
-                    if not group_config.is_eagle_group:
+                    if not apply_eagle_drop:
                         eagle_verified.clear()
                     if defer_lookup:
                         # make another iteration on all groups to check
@@ -891,10 +909,12 @@ class OffloadingConnectorScheduler:
         for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
             boundary_pending = False
             boundary_missed = False
+            boundary_keys = []
             for group_config in self.config.kv_group_configs:
                 key = self._make_boundary_key(
                     req_status.req, group_config.group_idx, boundary
                 )
+                boundary_keys.append(key)
                 result = self.manager.lookup(key, req_status.req_context)
                 if result is LookupResult.MISS:
                     boundary_missed = True
@@ -904,6 +924,12 @@ class OffloadingConnectorScheduler:
 
             pending |= boundary_pending
             if not boundary_missed and not boundary_pending:
+                for group_config, key in zip(
+                    self.config.kv_group_configs, boundary_keys
+                ):
+                    self._events_tracker.record_partial_lookup(
+                        req_status.req, group_config, boundary, key
+                    )
                 req_status.partial_tail_boundary = boundary
                 return boundary - local_tokens
 
@@ -1197,6 +1223,12 @@ class OffloadingConnectorScheduler:
             if not store_output.keys_to_store:
                 continue
 
+            for group_config, key in zip(self.config.kv_group_configs, keys):
+                if key in store_output.keys_to_store:
+                    self._events_tracker.record_partial_store(
+                        req, group_config, boundary, key
+                    )
+
             group_by_key = {key: idx for idx, key in enumerate(keys)}
             accepted_groups = [group_by_key[key] for key in store_output.keys_to_store]
             group_sizes = [0] * len(self.config.kv_group_configs)
@@ -1234,6 +1266,7 @@ class OffloadingConnectorScheduler:
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
         blocks_per_chunk = self.config.blocks_per_chunk
+        apply_eagle_drop = not self.use_eagle_prefix_cache_hashing
         store_jobs: dict[int, TransferJob] = {}
         for req_id in chain(
             scheduler_output.num_scheduled_tokens,
@@ -1263,7 +1296,10 @@ class OffloadingConnectorScheduler:
                 self.config.kv_group_configs, req_status.group_states
             ):
                 num_chunks = req_status.storable_chunks(
-                    group_config, group_state, num_offloadable_tokens
+                    group_config,
+                    group_state,
+                    num_offloadable_tokens,
+                    apply_eagle_drop,
                 )
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
@@ -1290,21 +1326,21 @@ class OffloadingConnectorScheduler:
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
                     # trailing chunks queried by _sliding_window_lookup are
-                    # reachable. EAGLE/MTP requires one additional chunk that
-                    # lookup later drops as its volatile draft tail.
+                    # reachable. Legacy EAGLE/MTP hashing requires one extra
+                    # chunk that lookup later drops as its volatile draft tail.
                     abs_chunk_idx = start_chunk_idx + key_idx
                     if not is_store_reachable_swa_chunk(
                         abs_chunk_idx,
                         num_chunks,
                         group_config.alignment_chunk_count,
                         group_config.sliding_window_size_in_chunks,
-                        group_config.is_eagle_group,
+                        apply_eagle_drop and group_config.is_eagle_group,
                     ):
                         continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                req_status.advance_stored_idx(num_offloadable_tokens, apply_eagle_drop)
                 continue
 
             store_output = self.manager.prepare_store(
@@ -1318,7 +1354,7 @@ class OffloadingConnectorScheduler:
                 continue
 
             if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                req_status.advance_stored_idx(num_offloadable_tokens, apply_eagle_drop)
                 continue
 
             self._touch(req_status)
@@ -1337,7 +1373,10 @@ class OffloadingConnectorScheduler:
                     group_config.sliding_window_size_in_chunks is not None
                 )
                 num_chunks = req_status.storable_chunks(
-                    group_config, group_state, num_offloadable_tokens
+                    group_config,
+                    group_state,
+                    num_offloadable_tokens,
+                    apply_eagle_drop,
                 )
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 block_ids = group_state.block_ids

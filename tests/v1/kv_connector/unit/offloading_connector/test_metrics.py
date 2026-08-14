@@ -101,10 +101,15 @@ class _FakeMetric:
 
 
 class _FakeVllmConfig:
-    def __init__(self, store_threshold: int = 2):
-        self.kv_transfer_config = SimpleNamespace(
-            kv_connector_extra_config={"store_threshold": store_threshold}
-        )
+    def __init__(
+        self,
+        store_threshold: int = 2,
+        extra_config: dict[str, Any] | None = None,
+    ):
+        config = {"store_threshold": store_threshold}
+        if extra_config is not None:
+            config.update(extra_config)
+        self.kv_transfer_config = SimpleNamespace(kv_connector_extra_config=config)
 
 
 def _spec_cls_with_metric_definitions(

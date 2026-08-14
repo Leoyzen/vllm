@@ -16,6 +16,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm.config import KVEventsConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
@@ -31,11 +32,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    get_sliding_window_size_in_chunks,
     is_store_reachable_swa_chunk,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     SlidingWindowSpec,
@@ -58,9 +61,12 @@ from vllm.v1.request import RequestStatus
 
 
 def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
-    vllm_config = _make_vllm_config()
+    vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
     vllm_config.cache_config.prefix_match_unit = 4
     vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
@@ -75,6 +81,8 @@ def _make_partial_tail_request(
     request.num_prompt_tokens = 30
     request.num_tokens = 30
     request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(7)]
+    request.all_token_ids = list(range(30))
+    request.lora_request = None
     request.is_finished.return_value = False
     scheduler.on_new_request(request)
     return request
@@ -99,8 +107,8 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
     req_status.group_states[1].block_ids[:] = [0, 21]
-    scheduler.manager.prepare_store.side_effect = (
-        lambda keys, req_context: generate_store_output(keys)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
     )
 
     output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
@@ -117,6 +125,34 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
         12: {job_id},
         99: {job_id},
     }
+    assert scheduler.config.supports_partial_tail
+
+    events = list(
+        scheduler._events_tracker.take_events(
+            [
+                OffloadingEvent(
+                    keys=list(scheduler._jobs[job_id].keys),
+                    medium=Medium.CPU,
+                    removed=False,
+                )
+            ]
+        )
+    )
+    assert len(events) == 2
+    assert all(isinstance(event, BlockStored) for event in events)
+    assert {event.group_idx for event in events} == {0, 1}
+    events_by_group = {event.group_idx: event for event in events}
+    full_attention_event = events_by_group[0]
+    assert full_attention_event.block_size == 4
+    assert full_attention_event.token_ids == list(range(16, 28))
+    assert len(full_attention_event.block_hashes) == 3
+    assert full_attention_event.parent_block_hash is not None
+
+    recurrent_event = events_by_group[1]
+    assert recurrent_event.block_size == 0
+    assert recurrent_event.token_ids == []
+    assert len(recurrent_event.block_hashes) == 1
+    assert recurrent_event.parent_block_hash is None
 
 
 def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
@@ -2402,6 +2438,36 @@ class TestEagle:
         # 3 hits, pop to 2 → 2 * block_size = 8 tokens loadable
         assert sched._lookup(req_status) == 8
 
+    def test_successor_hash_lookup_keeps_proven_boundary(self, request_runner):
+        """A successor hash proves the EAGLE boundary, so no hit is dropped."""
+        block_size = 4
+        groups = [
+            KVCacheGroupSpec(
+                ["layer0"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                is_eagle_group=True,
+            ),
+        ]
+        runner = request_runner(
+            block_size=block_size,
+            num_gpu_blocks=100,
+            async_scheduling=False,
+            kv_cache_groups=groups,
+        )
+        runner.scheduler_connector.set_eagle_prefix_cache_hashing(True)
+        runner.manager.lookup.return_value = LookupResult.HIT
+        sched = runner.connector_scheduler
+        req_status = self._make_req_status(
+            sched, num_tokens=12, offload_keys_per_group=[[1, 2, 3]]
+        )
+
+        assert sched._lookup(req_status) == 12
+
     def test_full_attn_lookup_single_block_returns_zero(self, request_runner):
         """Full-attn eagle group with 1 block hit → pop to 0 → returns 0."""
         block_size = 4
@@ -2926,6 +2992,34 @@ class TestEagle:
         runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=((0, 0),))
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
+    def test_successor_hash_store_stops_at_materialized_boundary(
+        self, request_runner, async_scheduling: bool
+    ):
+        """Offloading must not publish a hash before its draft KV exists."""
+        block_size = 4
+        blocks_per_chunk = 2
+        runner = request_runner(
+            block_size=block_size,
+            num_gpu_blocks=100,
+            async_scheduling=async_scheduling,
+            blocks_per_chunk=blocks_per_chunk,
+        )
+        connector = runner.scheduler_connector
+        assert connector.supports_eagle_prefix_cache_hashing
+        connector.set_eagle_prefix_cache_hashing(True)
+
+        request = runner.new_request(token_ids=[0] * block_size * 4)
+        request.mark_eagle_hashes_publishable(3 * block_size, block_size)
+        runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output(keys)
+        )
+
+        runner.run(
+            decoded_tokens=[EOS_TOKEN_ID],
+            expected_stored=((0, 0), (0, 1)),
+        )
+
+    @pytest.mark.parametrize("async_scheduling", [True, False])
     def test_multichunk_store_no_interior_holes(
         self, request_runner, async_scheduling: bool
     ):
@@ -3311,3 +3405,19 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     # Verify fence is empty after full lifecycle (cleanup happened).
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
     assert len(runner.connector_scheduler._jobs) == 0
+
+
+def test_chunked_local_attention_reports_its_chunk_window():
+    """Llama 4 uses chunked local attention, which used to trip the
+    FullAttentionSpec assert and kill the engine at startup."""
+    spec = ChunkedLocalAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.bfloat16,
+        attention_chunk_size=8192,
+    )
+
+    assert get_sliding_window_size_in_chunks(spec, tokens_per_chunk=1024) == 8
+    # Partial chunks round up, so the reachable tail is never understated.
+    assert get_sliding_window_size_in_chunks(spec, tokens_per_chunk=3000) == 3
