@@ -285,8 +285,24 @@ class MooncakeStoreScheduler:
                 if req_tuple is None:
                     raise ValueError(f"Request {req_id} is not in _unfinished_requests")
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if new_block_ids is None:
-                    new_block_ids = tuple([] for _ in req_tuple[1])
+                if not new_block_ids:
+                    if not self.use_eagle_prefix_cache_hashing:
+                        continue
+                    # EAGLE hashing is active and an empty block list arrived
+                    # (precomputed empty KVCacheBlocks). Rebuild to the group
+                    # count the tracker was created with so downstream
+                    # ``update`` never sees a group-count mismatch. The
+                    # tracker's group count is authoritative: it was fixed at
+                    # prefill/resume time, while ``req_tuple[1]`` may carry an
+                    # empty block list (0 groups) when no external tokens were
+                    # loaded.
+                    tracker = self._request_trackers.get(req_id)
+                    if tracker is not None:
+                        new_block_ids = tuple([] for _ in tracker.allocated_block_ids)
+                    else:
+                        # No tracker (should not happen for a cached request);
+                        # fall back to the unfinished-request block list.
+                        new_block_ids = tuple([] for _ in req_tuple[1])
                 if not new_block_ids and not self.use_eagle_prefix_cache_hashing:
                     continue
 
