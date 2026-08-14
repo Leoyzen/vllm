@@ -586,27 +586,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         self.use_sparse = use_sparse
 
-        self.dcp_manager: MLADCPManager | None = None
-        if self.impl.dcp_world_size > 1:
-            query_dtype = (
-                current_platform.fp8_dtype()
-                if is_quantized_kv_cache(self.kv_cache_dtype)
-                and self.kv_cache_dtype != "fp8_ds_mla"
-                and self.impl.supports_quant_query_input
-                else dtype
-            )
-            self.dcp_manager = MLADCPManager(
-                vllm_config=vllm_config,
-                device=next(kv_b_proj.parameters()).device,
-                num_heads=self.num_heads,
-                query_head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
-                output_head_dim=self.kv_lora_rank,
-                query_dtype=query_dtype,
-                output_dtype=dtype,
-                padded_num_heads=self.q_pad_num_heads,
-                is_lse_base_on_e=self.impl.lse_base_on_e,
-                use_pcp=self.use_pcp,
-            )
+        _vllm_config = get_current_vllm_config_or_none()
+        self.dcp_a2a = (
+            _vllm_config is not None
+            and _vllm_config.parallel_config.decode_context_parallel_size > 1
+            and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
+        )
+
+        # Initialize q/k/v range constants.
+        # Project attention output through W_UV before the DCP merge: shrinks
+        # the merge payload from kv_lora_rank to v_head_dim per head.
+        self.W_UV_dcp: torch.Tensor | None = None
+
+        self.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
+        self.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
+        self.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
+
 
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
 
@@ -952,31 +947,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata.decode is not None
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
-            # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
-                assert lse is not None
-                assert self.dcp_manager is not None
-                seq_lens = (
-                    attn_metadata.decode.seq_lens
-                    if attn_metadata.decode is not None
-                    else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
-                        : attn_metadata.num_decodes
-                    ]
-                )
-                query_start_loc = attn_metadata.query_start_loc[
-                    : attn_metadata.num_decodes + 1
-                ]
-                attn_out = self.dcp_manager.combine(
-                    attn_out,
-                    lse,
-                    seq_lens=seq_lens,
-                    query_start_loc=query_start_loc,
-                )
-                if self.use_pcp:
-                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+            self._dcp_merge_and_v_up_proj(attn_out, lse, mqa_output_slice)
 
-            # v_up projection
-            self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks
@@ -1122,6 +1094,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         else:
             # Convert from (L, N, V) to (N, L, V)
             replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+            if getattr(self.impl, "dcp_world_size", 1) > 1:
+                # all_gather_into_tensor requires a contiguous input
+                self.W_UV_dcp = get_dcp_group().all_gather(
+                    self.W_UV.contiguous(), dim=0
+                )
             # Convert from (L, N, P) to (N, P, L)
             replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
             if self.dcp_q_replicate:
@@ -1168,6 +1145,57 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 
+    def _dcp_lse_merge(
+        self,
+        attn_out: torch.Tensor,
+        lse: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """LSE-weighted combine of the per-rank attention outputs across the
+        DCP group. The a2a transport can write directly into ``out``."""
+        if self.dcp_a2a:
+            return dcp_a2a_lse_reduce(
+                attn_out,
+                lse,
+                get_dcp_group(),
+                is_lse_base_on_e=self.impl.lse_base_on_e,
+                out=out,
+                valid_counts=getattr(self.impl, "_last_dcp_valid_counts", None),
+            )
+        return cp_lse_ag_out_rs(
+            attn_out,
+            lse,
+            get_dcp_group(),
+            is_lse_base_on_e=self.impl.lse_base_on_e,
+        )
+
+    def _dcp_merge_and_v_up_proj(
+        self,
+        attn_out: torch.Tensor,
+        lse: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Combine the decode attention output across DCP ranks (if any) and
+        apply the W_UV up-projection into ``out`` (flattened v_head_dim)."""
+        if self.impl.dcp_world_size > 1 and self.W_UV_dcp is not None:
+            # Project kv_lora_rank -> v_head_dim BEFORE the merge to halve the
+            # DCP exchange payload; the LSE-weighted merge commutes with the
+            # linear W_UV projection, so this is exact.
+            projected = attn_out.new_empty(
+                attn_out.shape[0], attn_out.shape[1], self.v_head_dim
+            )
+            self._v_up_proj_bmm(attn_out, projected, self.W_UV_dcp)
+            out_view = out.view(-1, self.num_heads, self.v_head_dim)
+            merged = self._dcp_lse_merge(projected, lse, out=out_view)
+            if merged is not out_view:
+                out.copy_(merged.reshape(out.shape))
+            return
+
+        # Project after the merge (dcp=1, or backends without a gathered W_UV).
+        if self.impl.dcp_world_size > 1:
+            attn_out = self._dcp_lse_merge(attn_out, lse, out=None)
+        self._v_up_proj(attn_out, out=out)
+
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
@@ -1191,6 +1219,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+
+    def _v_up_proj_bmm(
+        self, x: torch.Tensor, out: torch.Tensor, w_uv: torch.Tensor
+    ) -> None:
+        num_heads = w_uv.shape[0]
+        x = x.view(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
+        out = out.view(-1, num_heads, self.v_head_dim)
+        torch.bmm(x, w_uv, out=out.transpose(0, 1))
 
 
 def unified_mla_kv_cache_update(
