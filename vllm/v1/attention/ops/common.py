@@ -21,6 +21,12 @@ def mask_dcp_empty_shards_(
         or query_start_loc.shape[0] != seq_lens.shape[0] + 1
     ):
         raise ValueError("query_start_loc must contain one boundary per sequence")
+    if seq_lens.shape[0] == 0:
+        # No sequences local to this DCP rank (empty decode shard under
+        # MTP/context-parallel splitting): every row is an empty shard, so
+        # mask the whole LSE instead of indexing an empty tensor.
+        lse.fill_(float("-inf"))
+        return
 
     row_indices = torch.arange(
         lse.shape[0], device=lse.device, dtype=query_start_loc.dtype
