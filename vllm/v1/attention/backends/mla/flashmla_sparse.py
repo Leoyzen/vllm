@@ -349,10 +349,9 @@ class FlashMLASparseMetadataBuilder(
         self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
 
         if parallel_config.decode_context_parallel_size > 1:
-            # NOTE: the flashmla_sparse DCP path was originally validated only
-            # with the 'ag_rs' transport (a2a was added later through
-            # MLADCPManager.combine + dcp_a2a_lse_reduce). The backend-agnostic
-            # mix-batch guard below is the real DCP requirement.
+            # The backend-agnostic mix-batch guard below is the real DCP
+            # requirement (the DCP combine in MLADCPManager works with both
+            # the ag_rs and a2a transports).
             if not self.fp8_use_mixed_batch:
                 raise NotImplementedError(
                     "DCP for FlashMLA sparse is only supported on the "
@@ -883,8 +882,8 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         empty_rows = (topk_indices == -1).all(dim=-1)
         attn_out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
         lse_out.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
-        # The head-padding slice above can leave `out` non-contiguous, and the
-        # merge feeds it to reduce_scatter.
+        # The head-padding slice above can leave `out` non-contiguous; the DCP
+        # combine (ag_rs or a2a) needs contiguous [B, H, D] input.
         return attn_out.contiguous(), lse_out
 
     def _fp8_flash_mla_kernel(

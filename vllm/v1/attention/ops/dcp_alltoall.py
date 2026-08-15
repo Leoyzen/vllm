@@ -989,7 +989,11 @@ def dcp_a2a_lse_reduce(
         is_lse_base_on_e: If True, LSE is base e; if False, base 2
         out: Optional output tensor [B, H/N, D] to write the combined result.
         valid_counts: Optional [B] local valid sparse-block count. Tokens with
-            count 0 are packed as zero output and -inf LSE.
+            count 0 are packed as zero output and -inf LSE. Note: under the
+            MLADCPManager.combine contract (dense path) this is not passed -
+            sparse backends (flashmla) instead mask empty rows to (0, -inf)
+            inline before the combine, keeping every combine backend free of
+            sparse-specific packing.
         seq_lens, query_start_loc: Accepted for signature compatibility with
             the MLADCPManager.combine contract; the a2a pack path uses
             ``valid_counts`` for empty-shard handling instead.
