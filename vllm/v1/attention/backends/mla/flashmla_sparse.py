@@ -349,12 +349,10 @@ class FlashMLASparseMetadataBuilder(
         self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
 
         if parallel_config.decode_context_parallel_size > 1:
-            if parallel_config.dcp_comm_backend != "ag_rs":
-                raise NotImplementedError(
-                    "DCP for FlashMLA sparse is only validated with the "
-                    "default 'ag_rs' DCP comm backend; got "
-                    f"'{parallel_config.dcp_comm_backend}'"
-                )
+            # NOTE: the flashmla_sparse DCP path was originally validated only
+            # with the 'ag_rs' transport (a2a was added later through
+            # MLADCPManager.combine + dcp_a2a_lse_reduce). The backend-agnostic
+            # mix-batch guard below is the real DCP requirement.
             if not self.fp8_use_mixed_batch:
                 raise NotImplementedError(
                     "DCP for FlashMLA sparse is only supported on the "
