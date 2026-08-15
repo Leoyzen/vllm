@@ -233,20 +233,6 @@ class FlashMLASparseMetadata(AttentionMetadata):
     ) = None
     fp8_use_mixed_batch: bool = False
 
-    @property
-    def decode(self) -> FP8SeparatePrefillDecode.Decode | None:
-        """FP8 decode metadata, fowarded from ``fp8_extra_metadata``.
-
-        ``MLAAttention.forward_impl`` consults ``attn_metadata.decode`` for the
-        DCP output merge; for the FP8 sparse backends the decode data lives
-        inside ``fp8_extra_metadata`` (either ``FP8SeparatePrefillDecode`` or
-        the list-of-subchunks form), so expose it here.
-        """
-        extra = self.fp8_extra_metadata
-        if isinstance(extra, FlashMLASparseMetadata.FP8SeparatePrefillDecode):
-            return extra.decode
-        return None
-
 
 # Max tokens per prefill chunk buffer to stay within CUDA grid
 # limits (SM90 Hopper limit).
