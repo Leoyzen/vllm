@@ -189,6 +189,7 @@ def _make_pending_load_unfinished_request(
 ) -> None:
     request = SimpleNamespace(
         num_tokens=num_tokens,
+        num_prompt_tokens=num_tokens,
         block_hashes=block_hashes,
         num_output_placeholders=0,
     )
@@ -861,6 +862,7 @@ def test_eagle_materialized_prefix_is_retried_without_new_blocks():
     token_ids = list(range(32))
     request = SimpleNamespace(
         all_token_ids=token_ids,
+        num_prompt_tokens=len(token_ids),
         block_hashes=[b"eagle-0"],
         num_publishable_block_hashes=1,
         num_output_placeholders=0,
@@ -903,6 +905,7 @@ def test_eagle_finished_request_flushes_materialized_prefix():
     request = SimpleNamespace(
         request_id="req-0",
         all_token_ids=token_ids,
+        num_prompt_tokens=len(token_ids),
         block_hashes=[b"eagle-0"],
         num_tokens=32,
         num_publishable_block_hashes=1,
@@ -938,7 +941,9 @@ def test_eagle_finished_request_flushes_materialized_prefix():
 
     assert len(meta.requests) == 1
     assert meta.requests[0].block_hashes == [b"eagle-0"]
-    assert meta.requests[0].token_len_chunk == 16
+    # The publication fence no longer gates prefill-covered hashes, so the
+    # finished request flushes the full materialized prefix (32 tokens).
+    assert meta.requests[0].token_len_chunk == 32
 
 
 def test_eagle_cached_request_empty_block_list_uses_tracker_groups():
@@ -952,6 +957,7 @@ def test_eagle_cached_request_empty_block_list_uses_tracker_groups():
     token_ids = list(range(32))
     request = SimpleNamespace(
         all_token_ids=token_ids,
+        num_prompt_tokens=len(token_ids),
         block_hashes=[b"eagle-0"],
         num_publishable_block_hashes=1,
         num_output_placeholders=0,
@@ -986,3 +992,64 @@ def test_eagle_cached_request_empty_block_list_uses_tracker_groups():
 
     assert len(meta.requests) == 1
     assert scheduler._request_trackers["req-0"].allocated_block_ids == ([0, 1],)
+
+
+def test_eagle_cold_start_prefill_publishes_prompt_hashes():
+    """Regression: cold-start prefill must publish prefill-covered block hashes
+    even when the EAGLE publication fence is still 0.
+
+    num_publishable_block_hashes starts at 0 and only advances after decode
+    tokens are finalized, but save meta is built before the fence advances.
+    Prefill block hashes are suffix-bound to finalized prompt tokens, so they
+    must be exempted from the fence via max(fence, num_prompt_tokens //
+    hash_block_size); otherwise prefill KV is never written to distal stores.
+    """
+    scheduler = _make_bare_scheduler()
+    scheduler.use_eagle_prefix_cache_hashing = True
+    token_ids = list(range(32))
+    request = SimpleNamespace(
+        all_token_ids=token_ids,
+        num_prompt_tokens=32,
+        block_hashes=[b"eagle-0", b"eagle-1"],
+        num_publishable_block_hashes=0,
+        num_output_placeholders=0,
+    )
+    scheduler._unfinished_requests["req-0"] = (request, ([0, 1, 2, 3],))
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=32,
+        allocated_block_ids=([0, 1, 2, 3],),
+        num_saved_tokens=0,
+        token_ids=token_ids,
+        prefill_end_tokens=32,
+    )
+    out = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id="req-0",
+                num_computed_tokens=0,
+                prefill_token_ids=token_ids,
+                prompt_token_ids=token_ids,
+                block_ids=([0, 1, 2, 3],),
+            )
+        ],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            new_block_ids=[],
+            num_computed_tokens=[],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={"req-0": 32},
+        scheduled_spec_decode_tokens={},
+    )
+
+    meta = scheduler.build_connector_meta(out)
+
+    # rely on schedule_output_to_meta_new_reqs: token_len=32, hashes 32//16=2
+    assert len(meta.requests) == 1
+    req_meta = meta.requests[0]
+    assert len(req_meta.block_hashes) == 2
+    assert req_meta.token_len_chunk == 32
+    assert scheduler._request_trackers["req-0"].num_saved_tokens == 32
