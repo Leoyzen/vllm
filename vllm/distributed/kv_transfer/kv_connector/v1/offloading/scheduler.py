@@ -595,13 +595,15 @@ class OffloadingConnectorScheduler:
     ) -> int:
         num = min(num_computed_tokens, req_status.req.num_tokens)
         if self.use_eagle_prefix_cache_hashing:
-            # A successor key is safe to expose only after both target and
-            # draft KV have materialized through its boundary.
-            num = min(
-                num,
-                req_status.req.num_publishable_block_hashes
-                * self.config.tokens_per_hash,
+            # Prefill block hashes are suffix-bound to finalized prompt
+            # tokens, so they must not be gated by the publication fence.
+            prefill_hashes = (
+                req_status.req.num_prompt_tokens // self.config.tokens_per_hash
             )
+            publishable = max(
+                req_status.req.num_publishable_block_hashes, prefill_hashes
+            )
+            num = min(num, publishable * self.config.tokens_per_hash)
         max_offload_tokens = req_status.max_offload_tokens
         if max_offload_tokens is not None:
             num = min(num, max_offload_tokens)
