@@ -84,7 +84,9 @@ class MooncakeStoreScheduler:
 
     def _publishable_hashes(self, request: Request) -> list[BlockHash]:
         if self.use_eagle_prefix_cache_hashing:
-            return request.block_hashes[: request.num_publishable_block_hashes]
+            prefill_hashes = request.num_prompt_tokens // self._hash_block_size
+            publishable = max(request.num_publishable_block_hashes, prefill_hashes)
+            return request.block_hashes[:publishable]
         return request.block_hashes
 
     def _request_hashes_for_meta(
@@ -107,7 +109,9 @@ class MooncakeStoreScheduler:
             and load_spec.can_load
         ):
             return None
-        return request.num_publishable_block_hashes * self._hash_block_size
+        prefill_hashes = request.num_prompt_tokens // self._hash_block_size
+        publishable = max(request.num_publishable_block_hashes, prefill_hashes)
+        return publishable * self._hash_block_size
 
     def get_num_new_matched_tokens(
         self,
@@ -480,9 +484,11 @@ class MooncakeStoreScheduler:
             return False, None
 
         if self.use_eagle_prefix_cache_hashing:
+            prefill_hashes = request.num_prompt_tokens // self._hash_block_size
             tracker.token_len = min(
                 request.num_tokens,
-                request.num_publishable_block_hashes * self._hash_block_size,
+                max(request.num_publishable_block_hashes, prefill_hashes)
+                * self._hash_block_size,
             )
             tracker.allocated_block_ids = tuple(group.copy() for group in block_ids)
             req_meta = ReqMeta.from_request_tracker(
