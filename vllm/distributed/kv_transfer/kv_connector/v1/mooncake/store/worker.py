@@ -784,15 +784,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # Resume from where this rank left off; only the new suffix is saved.
             save_start = self._saved_offset.get(req_id, 0)
 
-            # Clamp to the published hash coverage: resumes that touch KV
-            # invalidated by another segment (e.g. DCP preemption) or a
-            # partially-loaded external hit can advance token_len beyond the
-            # block-hash list, which process_tokens asserts against.
-            max_hash_tokens = (
-                len(req_meta.block_hashes) * self.token_databases[0].hash_block_size
-            )
-            token_len = min(token_len, max_hash_tokens)
-
             # Within each lcm region only per-spec relevant chunks are loaded
             # (e.g., SWA or linear attn), so mask out irrelevant chunks
             store_masks = self.coord.store_mask(
@@ -822,16 +813,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     put_step=put_step,
                     put_step_rank=put_step_rank,
                 ):
-                    # Skip blocks this rank does not own (DCP interleave) or
-                    # that were released (aborted request): symmetric with the
-                    # partial-tail save and the load path guards. Otherwise
-                    # prepare_values indexes out of range / stores garbage.
-                    block_ids = block_ids_per_group[g_idx]
-                    chunk_idx = start // db.block_size
-                    if chunk_idx >= len(block_ids) or (
-                        block_ids[chunk_idx] == NULL_BLOCK_ID
-                    ):
-                        continue
                     starts.append(start)
                     ends.append(end)
                     keys.append(db.key_for(block_hash))
@@ -1087,18 +1068,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         for g_idx, db in enumerate(self.token_databases):
             mask = load_mask_per_group[g_idx]
             chunks: list[tuple[int, int]] = []
-            group_block_ids = req_meta.block_ids[g_idx]
             for start, end, block_hash in db.process_tokens(
                 token_len, req_meta.block_hashes, mask_num
             ):
                 chunk_idx = start // db.block_size
                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
-                    continue
-                # Skip blocks this rank does not own (DCP interleave):
-                # the producer saved them under another segment namespace.
-                if chunk_idx >= len(group_block_ids) or (
-                    group_block_ids[chunk_idx] == NULL_BLOCK_ID
-                ):
                     continue
                 key_list.append(db.key_for(block_hash))
                 chunks.append((start, end))
@@ -1110,13 +1084,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             block_id_list.extend(g_block_ids)
 
         # Rotate aligned lists by tp_rank for load balancing.
-        if not key_list:
-            # No blocks this rank owns to load (e.g. DCP interleave keeps
-            # all chunks on other ranks, or the request was aborted and
-            # blocks released); nothing to fetch.
-            self.set_finished_request(req_id)
-            self.request_queue.task_done()
-            return
         rotation = self.tp_rank % len(key_list)
         key_list_c = _rotate_list(key_list, rotation)
         addr_list_c = _rotate_list(addr_list, rotation)
@@ -1931,14 +1898,7 @@ class MooncakeStoreWorker:
         pos = 0
         for g_idx, hash_bytes in candidate_meta:
             count = len(self._lookup_key_prefixes[g_idx])
-            # DCP-interleaved MLA: each block lives in exactly one dcp
-            # namespace, so any() suffices; TP-sharded groups (Mamba,
-            # factor==1) need every rank shard, hence all().
-            if self.dcp_size > 1 and self._group_tp_replication_factors[g_idx] > 1:
-                check = any
-            else:
-                check = all
-            if check(res[pos + j] == 1 for j in range(count)):
+            if all(res[pos + j] == 1 for j in range(count)):
                 exists_set.add((g_idx, hash_bytes))
             pos += count
 
