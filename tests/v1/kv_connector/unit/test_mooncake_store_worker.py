@@ -145,7 +145,7 @@ def _make_load_req(
     return ReqMeta(
         req_id=req_id,
         token_len_chunk=token_len,
-        block_ids=(list(range(len(block_hashes))),),
+        block_ids=(list(range(1, len(block_hashes) + 1)),),
         block_hashes=block_hashes,
         load_spec=LoadSpec(
             vllm_cached_tokens=vllm_cached_tokens,
@@ -160,7 +160,7 @@ def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
     return ReqMeta(
         req_id=req_id,
         token_len_chunk=32,
-        block_ids=([0, 1],),
+        block_ids=([1, 2],),
         block_hashes=block_hashes,
         can_save=True,
     )
@@ -170,7 +170,7 @@ def _make_multi_group_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMe
     return ReqMeta(
         req_id=req_id,
         token_len_chunk=32,
-        block_ids=([0, 1], [2, 3]),
+        block_ids=([1, 2], [3, 4]),
         block_hashes=block_hashes,
         can_save=True,
     )
@@ -503,7 +503,7 @@ def test_store_sending_thread_delta_saves_only_new_full_attention_chunks():
         ReqMeta(
             req_id="req-a",
             token_len_chunk=64,
-            block_ids=([0, 1, 2, 3],),
+            block_ids=([1, 2, 3, 4],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
         )
@@ -529,7 +529,7 @@ def test_store_sending_thread_delta_strides_with_local_phase():
         ReqMeta(
             req_id="req-a",
             token_len_chunk=64,
-            block_ids=([0, 1, 2, 3],),
+            block_ids=([1, 2, 3, 4],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
         )
@@ -555,7 +555,7 @@ def test_tp_sharded_group_saves_every_block_on_every_rank():
         ReqMeta(
             req_id="req-a",
             token_len_chunk=64,
-            block_ids=([0, 1, 2, 3],),
+            block_ids=([1, 2, 3, 4],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
         )
@@ -581,7 +581,7 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
         ReqMeta(
             req_id="req-a",
             token_len_chunk=16,
-            block_ids=([0],),
+            block_ids=([1],),
             block_hashes=[b"a0"],
             can_save=True,
         )
@@ -600,7 +600,7 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
         ReqMeta(
             req_id="req-a",
             token_len_chunk=64,
-            block_ids=([0, 1, 2, 3],),
+            block_ids=([1, 2, 3, 4],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
         )
@@ -743,7 +743,7 @@ def test_store_sending_thread_delta_start_rank_saves_second_local_chunk():
         ReqMeta(
             req_id="req-a",
             token_len_chunk=64,
-            block_ids=([0, 1, 2, 3],),
+            block_ids=([1, 2, 3, 4],),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
         )
@@ -796,7 +796,7 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
         ReqMeta(
             req_id="req-a",
             token_len_chunk=64,
-            block_ids=([0, 1, 2, 3], [0, 1, 2, 3]),
+            block_ids=([1, 2, 3, 4], [1, 2, 3, 4]),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
         )
@@ -850,7 +850,7 @@ def test_store_sending_thread_prepares_missing_chunks_once_per_group():
         ReqMeta(
             req_id="req-a",
             token_len_chunk=48,
-            block_ids=([0, 1, 2], [2, 1, 0]),
+            block_ids=([1, 2, 3], [3, 2, 1]),
             block_hashes=[b"a0", b"a1", b"a2"],
             can_save=True,
         )
@@ -858,8 +858,8 @@ def test_store_sending_thread_prepares_missing_chunks_once_per_group():
 
     db0.prepare_value.assert_not_called()
     db1.prepare_value.assert_not_called()
-    db0.prepare_values.assert_called_once_with([(0, 16), (32, 48)], [0, 1, 2])
-    db1.prepare_values.assert_called_once_with([(16, 32), (32, 48)], [2, 1, 0])
+    db0.prepare_values.assert_called_once_with([(0, 16), (32, 48)], [1, 2, 3])
+    db1.prepare_values.assert_called_once_with([(16, 32), (32, 48)], [3, 2, 1])
 
     keys, addrs, sizes, _ = store.batch_put_from_multi_buffers.call_args.args
     assert [key.rsplit("@", 1)[-1] for key in keys] == [
@@ -868,7 +868,7 @@ def test_store_sending_thread_prepares_missing_chunks_once_per_group():
         "6131",
         "6132",
     ]
-    assert addrs == [[0x1000], [0x1200], [0x2200], [0x2000]]
+    assert addrs == [[0x1100], [0x1300], [0x2400], [0x2200]]
     assert sizes == [[256], [256], [512], [512]]
 
 
@@ -937,7 +937,7 @@ def test_store_recving_thread_reports_failed_block_ids():
     )
 
     assert thread.get_and_clear_finished_requests() == {"req-a"}
-    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {2, 3}
     assert thread.get_and_clear_block_ids_with_load_errors() == set()
 
 
@@ -954,7 +954,7 @@ def test_store_recving_thread_reports_failed_block_ids_after_rotation():
         )
     )
 
-    assert thread.get_and_clear_block_ids_with_load_errors() == {2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {3}
 
 
 def test_store_recving_thread_reports_all_attempted_blocks_on_exception():
@@ -971,7 +971,7 @@ def test_store_recving_thread_reports_all_attempted_blocks_on_exception():
     )
 
     assert thread.get_and_clear_finished_requests() == {"req-a"}
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2, 3}
 
 
 def test_store_worker_get_block_ids_with_load_errors_delegates_to_recv_thread():
@@ -1218,7 +1218,7 @@ def test_store_sending_thread_multiple_segments_share_logical_group_id():
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
     ]
-    assert addrs == [[0x1000, 0x2000], [0x1100, 0x2100]]
+    assert addrs == [[0x1100, 0x2100], [0x1200, 0x2200]]
     assert sizes == [[256, 256], [256, 256]]
     assert config.group_ids == [
         "vllm-mooncake-store:test-model@6130",
@@ -1270,7 +1270,7 @@ def test_store_sending_thread_group_ids_share_across_kv_cache_groups():
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@6130",
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@6131",
     ]
-    assert addrs == [[0x1000], [0x1100], [0x3200], [0x3300]]
+    assert addrs == [[0x1100], [0x1200], [0x3300], [0x3400]]
     assert sizes == [[256], [256], [256], [256]]
     # Different vLLM KV cache groups for the same prefix chunk share the
     # same Mooncake lifecycle group id.
@@ -1467,8 +1467,8 @@ def test_recv_thread_splits_disk_offload_loads_by_budget():
     ]
     base_addr = thread.token_databases[0].kv_caches_base_addr[0]
     block_len = thread.token_databases[0].block_len[0]
-    assert first_addrs == [[base_addr], [base_addr + block_len]]
-    assert second_addrs == [[base_addr + 2 * block_len]]
+    assert first_addrs == [[base_addr + block_len], [base_addr + 2 * block_len]]
+    assert second_addrs == [[base_addr + 3 * block_len]]
     expected_size = block_len
     assert first_sizes == [[expected_size], [expected_size]]
     assert second_sizes == [[expected_size]]
@@ -1491,7 +1491,7 @@ def test_recv_thread_stops_after_first_failing_disk_offload_sub_batch():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 1
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2}
 
 
 def test_recv_thread_skips_split_when_budget_holds_all_keys():
@@ -1540,7 +1540,7 @@ def test_recv_thread_reports_unsplittable_key_larger_than_budget():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 0
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2, 3}
 
 
 def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
@@ -1871,7 +1871,7 @@ def test_store_sending_thread_clamps_token_len_to_lcm():
         ReqMeta(
             req_id="r0",
             token_len_chunk=33,
-            block_ids=([0, 1, 2],),
+            block_ids=([1, 2, 3],),
             block_hashes=[b"a0", b"a1", b"a2"],
             can_save=True,
         )
@@ -1910,7 +1910,7 @@ def test_store_sending_thread_skips_when_token_len_below_lcm():
         ReqMeta(
             req_id="r0",
             token_len_chunk=32,
-            block_ids=([0, 1],),
+            block_ids=([1, 2],),
             block_hashes=[b"a0", b"a1"],
             can_save=True,
         )
@@ -1987,7 +1987,7 @@ def test_store_sending_thread_only_stores_swa_blocks_in_window():
         ReqMeta(
             req_id="r0",
             token_len_chunk=64,
-            block_ids=([0, 1], list(range(8))),
+            block_ids=([1, 2], list(range(1, 9))),
             block_hashes=hs,
             can_save=True,
         )
@@ -2063,7 +2063,7 @@ def test_store_sending_thread_delta_saves_only_new_swa_boundary_chunks():
         ReqMeta(
             req_id="r0",
             token_len_chunk=64,
-            block_ids=([0, 1], list(range(8))),
+            block_ids=([1, 2], list(range(1, 9))),
             block_hashes=hs,
             can_save=True,
         )
@@ -2133,7 +2133,7 @@ def test_store_sending_thread_kv_events_use_group_chunk_metadata():
         ReqMeta(
             req_id="r0",
             token_len_chunk=32,
-            block_ids=([0], list(range(4))),
+            block_ids=([1], list(range(1, 5))),
             block_hashes=hs,
             can_save=True,
             token_ids=list(range(32)),
