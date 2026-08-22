@@ -642,6 +642,11 @@ class SpeculativeConfig:
                 )
             )
 
+        # num_speculative_tokens changes the verification shape
+        factors.append(self.num_speculative_tokens)
+        if self.num_speculative_tokens_per_batch_size is not None:
+            factors.append(tuple(self.num_speculative_tokens_per_batch_size))
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
