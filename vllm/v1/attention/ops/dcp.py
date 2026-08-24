@@ -788,7 +788,7 @@ def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
         )
         * speculative_tokens
     )
-    return min(
+    return max(
         scheduler_config.max_num_batched_tokens,
         max(
             scheduler_config.max_num_seqs * tokens_per_seq,
