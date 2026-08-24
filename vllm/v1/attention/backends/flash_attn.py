@@ -67,6 +67,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.worker.cp_utils import (
     run_split_fa2_dcp_context_attention,
@@ -163,6 +164,43 @@ class FlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if block_size % 16 != 0:
+            raise ValueError("Block size must be a multiple of 16.")
+        # K and V are packed into the content dim: logical (B, H, N, 2*D).
+        return (num_blocks, num_kv_heads, block_size, 2 * head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        # `stride_order` indicates the permutation that gets us from
+        # `get_kv_cache_shape` (logical (B, H, N, 2*D)) to the actual memory
+        # layout we want.
+        cache_layout = get_kv_cache_layout()
+        if cache_layout == "NHD" and include_num_layers_dimension:
+            # (num_blocks, num_layers, block_size, num_kv_heads, 2*head_size)
+            return (1, 0, 3, 2, 4)
+        elif cache_layout == "NHD":
+            # (num_blocks, block_size, num_kv_heads, 2*head_size)
+            stride_order = (0, 2, 1, 3)
+        elif cache_layout == "HND" and include_num_layers_dimension:
+            # (num_blocks, num_kv_heads, num_layers, block_size, 2*head_size)
+            return (1, 2, 0, 3, 4)
+        elif cache_layout == "HND":
+            # (num_blocks, num_kv_heads, block_size, 2*head_size)
+            stride_order = (0, 1, 2, 3)
+        else:
+            raise ValueError(f"Unknown cache layout format {cache_layout}.")
+        return stride_order
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -1272,6 +1310,15 @@ class FlashAttentionImpl(AttentionImpl):
         cu_seqlens_q = attn_metadata.query_start_loc
         max_seqlen_q = attn_metadata.max_query_len
         block_table = attn_metadata.block_table
+
+        # For a non-quantized cache the K/V descales are 1.0 no-ops. Force them
+        # to None so the context flash call never validates a descale shape
+        # (num_reqs, self.num_kv_heads) against the cache head count, which can
+        # be larger for a DCP KV-head-replicated draft cache (cache_num_kv_heads
+        # > self.num_kv_heads; see qwen3_dflash.py). Quantized caches keep their
+        # descales (there the head counts always match).
+        if not is_quantized_kv_cache(self.kv_cache_dtype):
+            q_descale = k_descale = v_descale = None
 
         query = query.contiguous()
         if attn_metadata.max_dcp_context_kv_len == 0:
