@@ -290,3 +290,22 @@ def test_deepseek_v32_dispatches_selected_mha(
             expected_args[1:],
         )
     )
+
+
+def test_deepseek_v32_qrep_skips_query_all_gather() -> None:
+    q = torch.empty(2, 4, 8)
+
+    class FailGroup:
+        def all_gather(self, *args, **kwargs):
+            pytest.fail("qrep must not all-gather query heads")
+
+    layer = SimpleNamespace(
+        use_pcp=False,
+        impl=SimpleNamespace(dcp_world_size=2, pcp_world_size=1),
+        dcp_q_replicate=True,
+        dcp_manager=SimpleNamespace(group=FailGroup()),
+    )
+
+    result = DeepseekV32Attention._gather_dcp_query(layer, q)
+
+    assert result is q

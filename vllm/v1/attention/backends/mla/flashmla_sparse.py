@@ -559,6 +559,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # MLA Specific Arguments
         topk_indices_buffer: torch.Tensor | None = None,
         indexer: "Indexer | None" = None,
+        dcp_q_replicate: bool = False,
         **mla_args,
     ) -> None:
         super().__init__(
@@ -585,14 +586,16 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
 
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        q_concat_heads = num_heads
+        q_concat_num_heads = num_heads
         if not is_quantized_kv_cache(kv_cache_dtype):
-            q_concat_heads = (
-                (num_heads + self.prefill_padding - 1)
+            q_concat_num_heads = (
+                (q_concat_num_heads + self.prefill_padding - 1)
                 // self.prefill_padding
                 * self.prefill_padding
             )
-        q_concat_shape = (max_tokens, q_concat_heads, head_size)
+        if dcp_q_replicate:
+            q_concat_num_heads *= self.dcp_world_size
+        q_concat_shape = (max_tokens, q_concat_num_heads, head_size)
         if is_quantized_kv_cache(kv_cache_dtype):
             assert kv_cache_dtype == "fp8_ds_mla", (
                 "FlashMLA Sparse Attention backend fp8 only supports "
