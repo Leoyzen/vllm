@@ -121,6 +121,14 @@ class DeepseekV32Attention(MLAAttention):
     indexer: "DeepseekV32Indexer | None"
     indexer_cls: "type[DeepseekV32Indexer]" = DeepseekV32Indexer
 
+    # GLM-5.x/DeepSeek-V3.2 DSA models run the sparse MQA path exclusively.
+    # The dense/masked MHA prefill path does not yet distribute the output
+    # buffer by the DCP query-replication factor, so under DCP > 1 the copied
+    # query heads overflow the locally-sized output (2048 vs 8192 with DCP=4).
+    # Restored from #52512 (removed by #53785) to route through the DCP-aware
+    # sparse MQA path instead.
+    supports_dense_mha_prefill = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
