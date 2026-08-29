@@ -121,14 +121,6 @@ class DeepseekV32Attention(MLAAttention):
     indexer: "DeepseekV32Indexer | None"
     indexer_cls: "type[DeepseekV32Indexer]" = DeepseekV32Indexer
 
-    # GLM-5.x/DeepSeek-V3.2 DSA models run the sparse MQA path exclusively.
-    # The dense/masked MHA prefill path does not yet distribute the output
-    # buffer by the DCP query-replication factor, so under DCP > 1 the copied
-    # query heads overflow the locally-sized output (2048 vs 8192 with DCP=4).
-    # Restored from #52512 (removed by #53785) to route through the DCP-aware
-    # sparse MQA path instead.
-    supports_dense_mha_prefill = False
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -543,6 +535,13 @@ class DeepseekV32Attention(MLAAttention):
             assert kv_c is not None and k_pe is not None
             mha_q_pe = self.rotary_emb(positions, q_pe)[0] if self._fp8_query else mqa_q
             mha_q = torch.cat((q_nope, mha_q_pe), dim=-1)
+            if self.dcp_q_replicate:
+                # qrep materialized the DCP group's head set (e.g. 32 heads
+                # under TP8/DCP4); the dense MHA path is written for the
+                # TP-local shard. Mirror mla.py's _local_view slicing, which
+                # reserves the replicated heads for the MQA/decode segment.
+                mha_q = self.q_b_proj._local_view(mha_q)
+            assert mha_q.shape[-2] == self.num_local_heads
             self.forward_impl(
                 mha_q,
                 kv_c,

@@ -245,6 +245,8 @@ def test_deepseek_v32_dispatches_selected_mha(
         use_pcp=False,
         _fp8_query=fp8_query,
         _use_sparse_mha=lambda _: True,
+        dcp_q_replicate=False,
+        num_local_heads=1,
         rotary_emb=lambda _positions, q: (q + 1, None),
         forward_impl=record_forward_impl,
     )
