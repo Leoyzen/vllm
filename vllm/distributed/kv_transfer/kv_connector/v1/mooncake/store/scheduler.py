@@ -373,6 +373,12 @@ class MooncakeStoreScheduler:
                 load_spec = self.load_specs.pop(request_id, None)
                 if not load_spec:
                     continue
+                # A spec that cannot load must not forge save semantics: the
+                # request is not in this step's scheduler snapshot, so
+                # _apply_current_save_block_ids would assert on a missing
+                # block table.
+                if not load_spec.can_load:
+                    continue
                 num_tokens_to_compute = load_spec.kvpool_cached_tokens
                 request_tracker = RequestTracker(
                     req_id=request_id,
