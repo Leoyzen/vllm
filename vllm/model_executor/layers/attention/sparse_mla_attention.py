@@ -290,22 +290,31 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             prefill_max_seq_len = int(
                 seq_lens_cpu[num_decodes : num_decodes + num_prefills].max().item()
             )
+            # Dense-MHA under DCP>1 is untrusted: the per-rank context
+            # gather/reorg pipeline (_context_parallel_compute_prefill_
+            # context) is only validated for the block-granular interleave
+            # regime, and even ctx==0 novel prefills measured mildly wrong
+            # under DCP>1. Allow dense only at DCP==1; route everything
+            # else through the sparse MQA path, whose DCP combine is
+            # correct.
+            chunked_context = self._build_chunked_context_fields(
+                common_attn_metadata,
+                num_decodes,
+                num_prefills,
+                prefill_query_lens_cpu,
+            )
             prefill = MLACommonPrefillMetadata(
                 block_table=common_attn_metadata.block_table_tensor[num_decodes:, ...],
                 query_start_loc=prefill_query_start_loc,
                 max_query_len=prefill_max_query_len,
                 query_lens_cpu=prefill_query_lens_cpu,
-                chunked_context=self._build_chunked_context_fields(
-                    common_attn_metadata,
-                    num_decodes,
-                    num_prefills,
-                    prefill_query_lens_cpu,
-                ),
+                chunked_context=chunked_context,
                 q_data_type=self.model_config.dtype,
                 output_dtype=self.model_config.dtype,
                 prefill_backend=self._prefill_backend,
                 use_dense_mha=(
                     prefill_max_seq_len <= self.topk_tokens
+                    and self.dcp_world_size <= 1
                     and not self.vllm_config.attention_config.sparse_mla_force_mqa
                 ),
                 topk_mask_workspace=self.topk_mask_workspace,
