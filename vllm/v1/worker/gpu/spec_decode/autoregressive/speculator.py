@@ -380,6 +380,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -412,6 +413,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
+            if getattr(self, "_supports_spec_step_idx", False):
+                model_inputs["spec_step_idx"] = spec_step_idx
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
                 # chosen inside run_pw_graph.
@@ -523,6 +526,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     slot_mappings_by_layer,
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
+                    spec_step_idx=step,
                 )
 
     def _fused_multi_step_decode(
@@ -599,6 +603,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 slot_mappings,
                 num_tokens_across_dp,
                 cudagraph_runtime_mode,
+                spec_step_idx=step,
             )
             if (
                 step < self.num_speculative_steps - 1
@@ -622,6 +627,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        spec_step_idx: int = 0,
     ) -> None:
         self._prepare_eplb_forward(num_reqs)
 
@@ -633,6 +639,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
+            spec_step_idx=spec_step_idx,
         )
 
         # Sample the draft tokens.
@@ -646,6 +653,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.seeds,
             self.current_draft_step,
             self.draft_logits,
+            spec_step_idx,
         )
 
         # Update the inputs for the next step.

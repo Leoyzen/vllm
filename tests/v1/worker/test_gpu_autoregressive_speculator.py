@@ -311,7 +311,63 @@ def test_run_model_unpacks_tuple_return_for_mtp(monkeypatch):
     assert actual_feedback_hidden is feedback_hidden
 
 
-def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
+def test_spec_step_idx_propagated_to_forward_and_logits(monkeypatch):
+    captured = {}
+
+    class _RecordingModel(torch.nn.Module):
+        def forward(self, **kwargs):
+            captured["forward"] = kwargs.get("spec_step_idx")
+            return torch.zeros(4, 3)
+
+        def compute_logits(self, hidden_states, spec_step_idx=0):
+            captured["logits"] = spec_step_idx
+            return torch.zeros(4, 4)
+
+    speculator = _make_speculator(monkeypatch, torch.zeros(4, 3))
+    speculator.model = _RecordingModel()
+    speculator._supports_spec_step_idx = True
+
+    speculator._run_model(
+        4,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        spec_step_idx=2,
+    )
+    assert captured["forward"] == 2
+
+    monkeypatch.setattr(
+        base_spec_module,
+        "gumbel_sample",
+        lambda *a, **k: torch.zeros(4, dtype=torch.long),
+    )
+    speculator.use_fp64_gumbel = False
+    speculator.sample_draft(
+        torch.zeros(4, 3),
+        torch.zeros(4, dtype=torch.long),
+        torch.arange(4),
+        torch.ones(4),
+        torch.zeros(4, 2),
+        torch.zeros(4, dtype=torch.int32),
+        torch.zeros(4, 4),
+        spec_step_idx=2,
+    )
+    assert captured["logits"] == 2
+
+    # Unsupported models must not receive the kwarg (old behavior).
+    plain = _make_speculator(monkeypatch, torch.zeros(4, 3))
+    plain.model = _RecordingModel()
+    plain._supports_spec_step_idx = False
+    plain._run_model(
+        4,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        spec_step_idx=3,
+    )
+    assert captured["forward"] is None
     hidden = torch.full((4, 3), 1.0)
     speculator = _make_speculator(monkeypatch, hidden)
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any
@@ -184,6 +185,16 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
+        # The draft model selects its MTP layer via spec_step_idx % num_mtp_layers;
+        # thread the current draft step through so multi-layer MTP drafters use the
+        # layer trained for the current depth instead of always the first one.
+        # Models whose forward/compute_logits do not accept spec_step_idx (e.g.
+        # EAGLE-family drafters) keep the previous behavior.
+        self._supports_spec_step_idx = (
+            "spec_step_idx" in inspect.signature(self.model.forward).parameters
+            and "spec_step_idx"
+            in inspect.signature(self.model.compute_logits).parameters
+        )
 
         all_attn_layers = set[str](
             get_layers_from_vllm_config(
@@ -370,9 +381,15 @@ class DraftModelSpeculator(BaseSpeculator):
         seeds: torch.Tensor,
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
+        spec_step_idx: int = 0,
     ) -> torch.Tensor:
         if draft_logits is not None:
-            logits = self.model.compute_logits(hidden_states)
+            if getattr(self, "_supports_spec_step_idx", False):
+                logits = self.model.compute_logits(
+                    hidden_states, spec_step_idx=spec_step_idx
+                )
+            else:
+                logits = self.model.compute_logits(hidden_states)
             return gumbel_sample(
                 logits,
                 idx_mapping,
