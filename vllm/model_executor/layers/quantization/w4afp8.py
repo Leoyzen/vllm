@@ -270,7 +270,7 @@ class W4AFP8MoEMethod(FusedMoEMethodBase):
             torch.distributed.all_reduce(
                 local_max,
                 op=torch.distributed.ReduceOp.MAX,
-                group=get_ep_group(),
+                group=get_ep_group().device_group,
             )
         return local_max[0].reshape(1), local_max[1].reshape(1)
 
