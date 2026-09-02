@@ -476,6 +476,67 @@ def test_pending_load_does_not_co_queue_save():
     assert tracker.num_saved_tokens == 0
 
 
+def test_pending_load_with_dead_spec_emits_nothing():
+    # Regression: a parked request whose LoadSpec has can_load=False (e.g. the
+    # async load failed and the core requeued it) can neither load nor save
+    # this step, because it was never scheduled and has no freshly computed
+    # tokens. Fabricating a save here crashed on "Missing current block
+    # table": the request is absent from the core's kv_connector_block_state
+    # snapshot, which only covers requests scheduled this step.
+    scheduler = _make_bare_scheduler()
+    _make_pending_load_unfinished_request(
+        scheduler,
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+    scheduler.load_specs["req-0"] = LoadSpec(
+        vllm_cached_tokens=0,
+        kvpool_cached_tokens=48,
+        can_load=False,
+    )
+    scheduler_output = _make_pending_load_scheduler_output()
+    scheduler_output.kv_connector_block_state = KVConnectorBlockState(
+        block_ids={}, boundary_state_offloads={}
+    )
+
+    meta = scheduler.build_connector_meta(scheduler_output)
+
+    assert meta.requests == []
+    # The dead spec is consumed, and no tracker/save state is created for it.
+    assert scheduler.load_specs == {}
+    assert scheduler._request_trackers == {}
+
+
+def test_missing_block_table_drops_save_instead_of_asserting():
+    # Regression (production incident 2026-09-02): a request rescheduled after
+    # a KV load failure (#19330 recovery) can carry a can_save=True ReqMeta
+    # while being absent from this step's kv_connector_block_state snapshot,
+    # whose block tables only cover requests scheduled this step. The old
+    # `assert block_ids is not None` then killed EngineCore with "Missing
+    # current block table for store request". The save must be dropped instead,
+    # letting the request re-save on a later boundary.
+    scheduler = _make_bare_scheduler()
+    scheduler._unfinished_requests["req-0"] = (
+        _make_new_scheduler_output().request,
+        ([0, 1],),
+    )
+    scheduler_output = _make_new_scheduler_output()
+    # ReqMeta comes out can_save=True, but the core snapshot has no block
+    # table for it (empty dict, as after a load-failure recovery + reschedule).
+    scheduler_output.kv_connector_block_state = KVConnectorBlockState(
+        block_ids={}, boundary_state_offloads={}
+    )
+
+    meta = scheduler.build_connector_meta(scheduler_output)
+
+    # No exception; the request survives with save disabled and no block ids
+    # pinned, so the worker emits nothing and the tracker is preserved for a
+    # later normal save.
+    assert len(meta.requests) == 1
+    assert meta.requests[0].can_save is False
+    assert scheduler._request_trackers["req-0"] is not None
+
+
 def _make_resumed_unfinished_request(
     scheduler: MooncakeStoreScheduler,
     *,

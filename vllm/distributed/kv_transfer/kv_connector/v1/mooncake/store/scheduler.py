@@ -372,7 +372,13 @@ class MooncakeStoreScheduler:
         ) in self._unfinished_requests.items():
             if request_id not in request_ids and request_id not in cached_reqs.req_ids:
                 load_spec = self.load_specs.pop(request_id, None)
-                if not load_spec:
+                # A spec that cannot load yet has no save authorization either:
+                # the request is unscheduled this step, so emitting a save here
+                # fabricates store work with no current block table backing it
+                # (the core's kv_connector_block_state snapshot only covers
+                # requests scheduled this step). Skip so the request retries via
+                # normal scheduling instead of forging save semantics.
+                if not load_spec or not load_spec.can_load:
                     continue
                 num_tokens_to_compute = load_spec.kvpool_cached_tokens
                 request_tracker = RequestTracker(
@@ -430,9 +436,20 @@ class MooncakeStoreScheduler:
         )
         for req_meta in save_metas:
             block_ids = block_state.block_ids.get(req_meta.req_id)
-            assert block_ids is not None, (
-                f"Missing current block table for store request {req_meta.req_id}"
-            )
+            if block_ids is None:
+                # The core's kv_connector_block_state only snapshots requests
+                # scheduled this step. A request rescheduled after a KV load
+                # failure (#19330 recovery) can otherwise slip a can_save=True
+                # ReqMeta through with its blocks already released. Dropping
+                # the save is safe: the request re-saves on a later boundary
+                # instead of killing EngineCore with a fatal assert.
+                logger.warning(
+                    "Skipping store for %s: not present in the current "
+                    "scheduler snapshot (no current block table)",
+                    req_meta.req_id,
+                )
+                req_meta.can_save = False
+                continue
             req_meta.block_ids = block_ids
 
     def _reference_save_blocks(self, meta: MooncakeStoreConnectorMetadata) -> None:
