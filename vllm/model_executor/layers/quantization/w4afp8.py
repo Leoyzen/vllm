@@ -254,17 +254,27 @@ class W4AFP8MoEMethod(FusedMoEMethodBase):
     @staticmethod
     def _prepare_input_scales(
         layer: RoutedExperts,
+        ep_size: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            layer.w13_input_scale.max().to(torch.float32).reshape(1),
-            layer.w2_input_scale.max().to(torch.float32).reshape(1),
+        # Each rank only holds input scales for its local experts, so the
+        # checkpoint-wide max requires a cross-EP reduction when EP > 1.
+        local_max = torch.stack(
+            (
+                layer.w13_input_scale.to(torch.float32).max(),
+                layer.w2_input_scale.to(torch.float32).max(),
+            )
         )
+        if ep_size > 1:
+            from vllm.distributed.parallel_state import get_ep_group
+
+            torch.distributed.all_reduce(
+                local_max,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_ep_group(),
+            )
+        return local_max[0].reshape(1), local_max[1].reshape(1)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        if self.moe.moe_parallel_config.ep_size != 1:
-            raise NotImplementedError(
-                "W4AFP8 currently supports expert parallel size 1 only"
-            )
         if self.moe.moe_parallel_config.use_batched_activation_format:
             raise NotImplementedError(
                 "W4AFP8 does not support the batched-expert activation format"
@@ -288,7 +298,9 @@ class W4AFP8MoEMethod(FusedMoEMethodBase):
         )
         from vllm.utils.humming import HummingInputSchema, dtypes
 
-        a1_scale, a2_scale = self._prepare_input_scales(layer)
+        a1_scale, a2_scale = self._prepare_input_scales(
+            layer, ep_size=self.moe.moe_parallel_config.ep_size
+        )
         self.humming_configs = convert_to_humming_moe_kernel_format(
             layer,
             weight_schema=_W4AFP8HummingWeightSchema(self.group_size),

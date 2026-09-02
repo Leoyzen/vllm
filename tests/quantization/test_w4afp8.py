@@ -159,19 +159,16 @@ def test_w4afp8_reduces_checkpoint_input_scales_like_sglang() -> None:
 
 @pytest.mark.parametrize(
     (
-        "ep_size",
         "use_batched_activation_format",
         "apply_router_weight_on_input",
         "match",
     ),
     [
-        (2, False, False, "expert parallel size 1"),
-        (1, True, False, "batched-expert activation format"),
-        (1, False, True, "router weights on input"),
+        (True, False, "batched-expert activation format"),
+        (False, True, "router weights on input"),
     ],
 )
 def test_w4afp8_rejects_unsupported_moe_formats(
-    ep_size: int,
     use_batched_activation_format: bool,
     apply_router_weight_on_input: bool,
     match: str,
@@ -179,7 +176,7 @@ def test_w4afp8_rejects_unsupported_moe_formats(
     method = object.__new__(W4AFP8MoEMethod)
     method.moe = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(
-            ep_size=ep_size, use_batched_activation_format=use_batched_activation_format
+            ep_size=1, use_batched_activation_format=use_batched_activation_format
         )
     )
     layer = SimpleNamespace(apply_router_weight_on_input=apply_router_weight_on_input)
