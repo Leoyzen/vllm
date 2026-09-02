@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+import ray
 import torch
 
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -13,6 +14,8 @@ from vllm.model_executor.layers.quantization.w4afp8 import (
     W4AFP8MoEMethod,
     _convert_signed_int4_to_uint4b8,
 )
+
+from ..utils import multi_process_parallel
 
 
 def test_w4afp8_config_resolves_checkpoint_quant_method() -> None:
@@ -183,3 +186,49 @@ def test_w4afp8_rejects_unsupported_moe_formats(
 
     with pytest.raises(NotImplementedError, match=match):
         method.process_weights_after_loading(layer)
+
+
+@ray.remote(max_calls=1)
+def w4afp8_ep_scale_consistency_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    del pp_size
+    # The scale reduction is collective-backend-agnostic; a gloo world group
+    # keeps the fixture CPU-only so it runs on single-GPU runners too.
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=tp_size,
+    )
+    ep_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_ep_group",
+        lambda: SimpleNamespace(device_group=ep_group),
+    )
+
+    # Fragments put the checkpoint-wide max on opposite ranks, so a reverted
+    # rank-local max fails on every rank.
+    if rank == 0:
+        w13_fragment = torch.tensor([[0.25, 0.5], [0.75, 0.125]], dtype=torch.bfloat16)
+        w2_fragment = torch.tensor([9.0, 0.5], dtype=torch.bfloat16)
+    else:
+        w13_fragment = torch.tensor([[2.0, 4.0], [8.0, 1.0]], dtype=torch.bfloat16)
+        w2_fragment = torch.tensor([0.25, 0.5], dtype=torch.bfloat16)
+    layer = SimpleNamespace(w13_input_scale=w13_fragment, w2_input_scale=w2_fragment)
+
+    a1_scale, a2_scale = W4AFP8MoEMethod._prepare_input_scales(layer, ep_size=tp_size)
+
+    # Identical to what an EP=1 rank holding every expert would derive.
+    torch.testing.assert_close(a1_scale, torch.tensor([8.0], dtype=torch.float32))
+    torch.testing.assert_close(a2_scale, torch.tensor([9.0], dtype=torch.float32))
+
+
+def test_w4afp8_ep_input_scale_reduction_is_checkpoint_wide(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    multi_process_parallel(monkeypatch, 2, 1, w4afp8_ep_scale_consistency_worker)
