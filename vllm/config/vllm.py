@@ -2919,6 +2919,7 @@ class VllmConfig:
                     # keep rejecting their sharded case.
                     dcp_replication_archs = {
                         "DFlashDraftModel",
+                        "DFlash2DraftModel",
                         "Qwen3DSparkModel",
                     }
                     draft_supports_dcp_replication = bool(
