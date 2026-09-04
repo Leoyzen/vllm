@@ -67,7 +67,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, KVQuantMode
 from vllm.v1.worker.cp_utils import (
     run_split_fa2_dcp_context_attention,
     should_skip_dcp_context_attention,
@@ -384,7 +384,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             return None
 
         cache_dtype = self.cache_config.cache_dtype
-        if is_quantized_kv_cache(cache_dtype):
+        # Mirror what mha_fwd infers from this group's KV tensors: the impl
+        # views any quantized cache as fp8 at forward time, while a per-group
+        # override (e.g. a spec-decode draft cache in model dtype) keeps its
+        # real storage dtype.
+        if is_quantized_kv_cache(cache_dtype) and (
+            self.kv_quant_mode != KVQuantMode.NONE
+        ):
             qkv_dtype = current_platform.fp8_dtype()
         else:
             qkv_dtype = self.kv_cache_dtype
@@ -438,6 +444,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         ) or self.model_config.get_num_attention_heads(self.parallel_config)
         self.num_heads_kv = kv_cache_spec.num_kv_heads
         self.kv_cache_dtype = kv_cache_spec.dtype
+        self.kv_quant_mode = kv_cache_spec.kv_quant_mode
         self.headdim = kv_cache_spec.head_size
         self.block_size = kv_cache_spec.block_size
 
