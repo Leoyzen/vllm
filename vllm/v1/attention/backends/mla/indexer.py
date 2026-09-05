@@ -679,6 +679,20 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int64,
             device=device,
         )
+        # Fused multi-step draft decode opt-in (see
+        # update_draft_decode_metadata). Default-off: without the env opt-in
+        # the builder declares no support, keeping pre-change behavior; the
+        # disable flag wins over the opt-in.
+        self.supports_draft_decode_metadata_update = (
+            envs.VLLM_ENABLE_FUSED_DRAFT_SPARSE_MLA
+            and not envs.VLLM_DISABLE_FUSED_DRAFT_SPARSE_MLA
+        )
+        # Common tensors the in-graph refresh needs; set by build().
+        self._last_block_table: torch.Tensor | None = None
+        self._last_query_start_loc: torch.Tensor | None = None
+        self._last_positions: torch.Tensor | None = None
+        self._last_num_reqs = 0
+        self._last_num_actual_tokens = 0
 
     def build(
         self,
@@ -705,6 +719,16 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
                 self.kv_cache_spec.block_size,
                 out=slot_mapping_buffer,
             )
+            # Stash the refresh inputs so update_draft_decode_metadata can
+            # recompute the circular mapping in-graph between draft steps.
+            self._last_block_table = common_attn_metadata.block_table_tensor
+            self._last_query_start_loc = common_attn_metadata.query_start_loc
+            self._last_positions = positions
+            self._last_num_reqs = common_attn_metadata.num_reqs
+            self._last_num_actual_tokens = common_attn_metadata.num_actual_tokens
+        elif self.supports_draft_decode_metadata_update:
+            # Without positions the mapping cannot be recomputed per step.
+            self.supports_draft_decode_metadata_update = False
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
@@ -713,6 +737,53 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
+        )
+
+    def update_draft_decode_metadata(
+        self, metadata: DeepseekV32IndexerMetadata
+    ) -> None:
+        """Recompute the circular slot mapping in place between draft steps.
+
+        The only step-dependent field this builder produces is
+        ``metadata.slot_mapping`` (``own_block * kpool + pos % kpool``); the
+        speculator advances ``positions`` between fused draft forwards, so a
+        stale mapping would write each draft token's tail state to the slot
+        of an earlier position — silently corrupting the circular tail cache
+        and collapsing acceptance. Refresh is therefore mandatory, never a
+        no-op.
+
+        Producer-before-consumer in captured graph order: the speculator's
+        ``compute_slot_mappings`` / positions advance runs before this hook
+        in the single capture stream, so the recomputation reads advanced
+        positions and the base slot mapping copy from the step's
+        ``compute_slot_mappings`` output. The rewrite targets the same
+        persistent ``slot_mapping_buffer`` view ``build()`` attached, so
+        captured consumers keep reading valid addresses.
+        """
+        slot_mapping = metadata.slot_mapping
+        if not (
+            isinstance(slot_mapping, torch.Tensor)
+            and slot_mapping.data_ptr() == self.slot_mapping_buffer.data_ptr()
+        ):
+            # Not our persistent buffer (positions were absent at build, or
+            # the metadata was replaced): nothing capture-safe to refresh.
+            return
+        if (
+            self._last_block_table is None
+            or self._last_query_start_loc is None
+            or self._last_positions is None
+            or self._last_num_actual_tokens == 0
+        ):
+            return
+        compute_kpool_tail_slot_mapping(
+            slot_mapping,
+            self._last_block_table,
+            self._last_query_start_loc,
+            self._last_positions,
+            self._last_num_actual_tokens,
+            self._last_num_reqs,
+            self.kv_cache_spec.block_size,
+            out=slot_mapping,
         )
 
 
