@@ -380,6 +380,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         max_seq_len: int,
         causal: bool | torch.Tensor,
         max_num_splits: int,
+        window_size: tuple[int, int] | None = None,
     ) -> torch.Tensor | None:
         if not aot_schedule:
             return None
@@ -407,7 +408,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             cu_seqlens_q=cu_query_lens,
             page_size=self.block_size,
             causal=causal,
-            window_size=_maybe_symmetrize_window(self.aot_sliding_window, causal),
+            window_size=(
+                window_size
+                if window_size is not None
+                else _maybe_symmetrize_window(self.aot_sliding_window, causal)
+            ),
             num_splits=max_num_splits,
         )
 
@@ -682,6 +687,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     max_seq_len=max_dcp_context_kv_len,
                     causal=False,
                     max_num_splits=max_num_splits,
+                    window_size=self.aot_sliding_window,
                 )
         elif use_cascade:
             cu_prefix_query_lens = torch.tensor(
