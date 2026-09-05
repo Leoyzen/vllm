@@ -309,3 +309,54 @@ def test_register_separate_kv_head_groups(monkeypatch):
     assert {cache.shape for cache in worker.gpu_kv_caches.values()} == {
         (num_blocks, per_group_block_bytes)
     }
+
+
+def test_register_mixed_page_size_shared_storage(monkeypatch):
+    """Mixed-page layers sharing one storage register as separate regions.
+
+    A UniformType group can pack layers with different page sizes into a
+    single allocation (e.g. DSA models: sparse-indexer layers beside MLA
+    layers). Blocks are block-outer within each layer's run, so each layer's
+    region is its own [num_blocks, page_bytes] slice. Viewing the whole
+    storage with the first layer's page size crashes the reshape on real
+    models (the storage size is not a multiple of one layer's page size).
+    """
+    num_blocks = 4
+    mla_page = 512  # bytes per block, MLA run
+    indexer_page = 128  # bytes per block, sparse-indexer run
+    cache_bytes = num_blocks * (mla_page + indexer_page)
+    raw = torch.zeros(cache_bytes, dtype=torch.int8, device="cuda")
+
+    # Layer 0 (MLA): blocks contiguous in [0, num_blocks * mla_page).
+    mla_cache = raw[: num_blocks * mla_page].view(num_blocks, mla_page)
+    # Layer 1 (indexer): its run starts after the MLA run, blocks contiguous.
+    indexer_cache = (
+        raw[num_blocks * mla_page :].contiguous().view(num_blocks, indexer_page)
+    )
+
+    worker = SimpleCPUOffloadWorker(
+        vllm_config=None,
+        kv_cache_config=MagicMock(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[MagicMock(size=cache_bytes)],
+        ),
+        cpu_capacity_bytes=cache_bytes,
+    )
+    worker._backend = MagicMock()
+    monkeypatch.setattr("vllm.v1.simple_kv_offload.worker.PIN_MEMORY", False)
+
+    worker.register_kv_caches({"layer.mla": mla_cache, "layer.indexer": indexer_cache})
+
+    assert worker.gpu_kv_caches is not None
+    assert set(worker.gpu_kv_caches) == {"layer.mla", "layer.indexer"}
+    assert worker.gpu_kv_caches["layer.mla"].shape == (num_blocks, mla_page)
+    assert worker.gpu_kv_caches["layer.indexer"].shape == (num_blocks, indexer_page)
+    # Region strides must be block-outer: block_id * bpb addresses each row.
+    assert worker.gpu_kv_caches["layer.mla"].stride(0) == mla_page
+    assert worker.gpu_kv_caches["layer.indexer"].stride(0) == indexer_page
+    # The regions must point at the right run offsets in the shared storage.
+    assert worker.gpu_kv_caches["layer.mla"].data_ptr() == raw.data_ptr()
+    assert (
+        worker.gpu_kv_caches["layer.indexer"].data_ptr()
+        == raw.data_ptr() + num_blocks * mla_page
+    )

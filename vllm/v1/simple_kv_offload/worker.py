@@ -100,34 +100,43 @@ class SimpleCPUOffloadWorker:
         assert self.kv_cache_config is not None
         num_blocks = self.kv_cache_config.num_blocks
         assert self.kv_cache_config.kv_cache_tensors
-        logical_storage_bytes = self.kv_cache_config.kv_cache_tensors[0].size
 
         # The DMA backend copies whole blocks as base + block_id * stride(0),
-        # so view each unique allocation as [num_blocks, block_bytes].
+        # so view each layer's run in its allocation as [num_blocks,
+        # block_bytes]. A layer's blocks are contiguous in the allocation
+        # (block b of layer l sits at b * block_bytes within l's run), but
+        # layers may share the allocation with *different* page sizes (e.g. a
+        # UniformType group packing MLA and sparse-indexer layers). Slicing
+        # the whole storage with one layer's page size misshapes every other
+        # layer, so each distinct run becomes its own region.
         unique_gpu_caches: dict[str, torch.Tensor] = {}
-        seen: set[tuple[torch.device, int]] = set()
+        seen_regions: set[tuple[torch.device, int, int]] = set()
         for name, tensor in kv_caches.items():
-            storage = tensor.untyped_storage()
-            key = (tensor.device, storage.data_ptr())
-            if key in seen:
-                continue
-            seen.add(key)
-
             physical_per_block, remainder = divmod(tensor.shape[0], num_blocks)
             assert remainder == 0, (
                 f"KV cache {name!r} has {tensor.shape[0]} physical blocks, which "
                 f"is not divisible by {num_blocks} scheduler blocks"
             )
             block_bytes = tensor.stride(0) * tensor.element_size() * physical_per_block
-            raw = torch.empty(0, dtype=torch.int8, device=tensor.device).set_(storage)
-            assert raw.numel() >= logical_storage_bytes, (
-                f"KV cache {name!r} storage has {raw.numel()} bytes, smaller "
-                f"than the configured {logical_storage_bytes}-byte allocation"
+
+            # Cache groups alias from byte 0, so layers of same-page groups
+            # register identical runs (same pointer, same page); collapse
+            # them so each page is copied once. Mixed-page layers keep
+            # separate runs at their own offsets.
+            region_key = (tensor.device, tensor.data_ptr(), block_bytes)
+            if region_key in seen_regions:
+                continue
+            seen_regions.add(region_key)
+
+            row_elems = block_bytes // tensor.element_size()
+            region = tensor.as_strided(
+                (num_blocks, row_elems),
+                (tensor.stride(0) * physical_per_block, 1),
+                storage_offset=tensor.storage_offset(),
             )
-            regions = raw[:logical_storage_bytes].view(-1, num_blocks, block_bytes)
-            for idx, region in enumerate(regions):
-                key_name = name if len(regions) == 1 else f"{name}.{idx}"
-                unique_gpu_caches[key_name] = region
+            if tensor.element_size() > 1:
+                region = region.view(torch.int8)
+            unique_gpu_caches[name] = region
 
         # Compute per-tensor bytes_per_block. Tensors may have different
         # page_size_bytes (e.g., UniformTypeKVCacheSpecs with varying head_size).
