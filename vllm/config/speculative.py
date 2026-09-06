@@ -1537,6 +1537,22 @@ class SpeculativeConfig:
                 "slot-mapping refresh hook expects the fused-draft path. "
                 "Unset the env var to run DFlash."
             )
+        # The hook serves the MTP fused-draft path; other spec methods
+        # (ngram/eagle/dspark) route draft decode elsewhere and must
+        # not run with the hook registered.
+        if (
+            self.method not in ("dflash", "mtp", None)
+            and envs.VLLM_ENABLE_FUSED_DRAFT_SPARSE_MLA
+            and self.target_model_config is not None
+            and getattr(self.target_model_config.hf_config, "model_type", None)
+            == "glm5_next"
+        ):
+            raise ValueError(
+                "GLM-5.3-Flash fused-draft decode "
+                "(VLLM_ENABLE_FUSED_DRAFT_SPARSE_MLA=1) requires the "
+                f"fused-draft path, but method='{self.method}' routes draft "
+                "decode elsewhere. Use method='mtp' or unset the env var."
+            )
         return self
 
     def _validate_suffix_decoding(self):
