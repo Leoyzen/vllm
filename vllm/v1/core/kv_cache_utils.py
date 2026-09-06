@@ -1170,8 +1170,11 @@ def _get_kv_cache_groups_glm5_next(
 
     External DFlash2 sliding-window draft layers join the slot-sharing layout:
     each draft group co-owns MLA slot tensors like a Mamba group (independent
-    logical block table, same physical page), with the block size matched to
-    the target's MLA logical span so the padded page is not mostly waste.
+    logical block table, same physical page). The draft's per-token KV can be
+    much wider than the target's (Qwen3-shaped draft next to fp8_ds_mla MLA),
+    so its logical block is shrunk to the largest divisor of the target's
+    block size whose unpadded page still fits one MLA slot, then padded to
+    ``mla_page`` like the Mamba groups.
     """
     mamba_specs = {
         name: spec
@@ -1212,8 +1215,26 @@ def _get_kv_cache_groups_glm5_next(
     mla_pages = {mla_specs[name].page_size_bytes for name in mla_names}
     assert len(mla_pages) == 1
     mla_page = mla_pages.pop()
-    if any(spec.page_size_bytes > mla_page for spec in sliding_specs.values()):
-        return None
+    # A draft page wider than one MLA slot can never join the slot-sharing
+    # layout, whatever its block size (page width scales with block size).
+    # Keep the fail-fast for that case; a shrunk block handles the rest.
+    sliding_buckets: dict[SlidingWindowSpec, list[str]] = defaultdict(list)
+    target_block_size = mla_specs[mla_names[0]].block_size
+    for name, spec in sliding_specs.items():
+        per_token = spec.unpadded_page_size_bytes // spec.block_size
+        if per_token > mla_page:
+            return None
+        spec = replace(spec, block_size=target_block_size)
+        if spec.unpadded_page_size_bytes > mla_page:
+            # Shrink the draft block to the largest divisor of the target's
+            # block size whose unpadded page fits one MLA slot. The hybrid
+            # manager supports unequal group block sizes (hash granularity is
+            # the GCD across groups), so a smaller draft block stays legal.
+            max_block = max(mla_page // per_token, 1)
+            spec = replace(
+                spec, block_size=_largest_divisor_at_most(target_block_size, max_block)
+            )
+        sliding_buckets[replace(spec, page_size_padded=mla_page)].append(name)
     uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
     assert uniform_spec is not None
 
@@ -1253,16 +1274,8 @@ def _get_kv_cache_groups_glm5_next(
 
     # External sliding-window drafts (DFlash2 GLM) co-own the MLA slot
     # tensors the same way Mamba groups do: an independent logical block
-    # table over the same physical page. The draft's native block size is a
-    # tiny span; match the target's logical span before padding so the pool
-    # page is not mostly waste.
-    sliding_buckets: dict[SlidingWindowSpec, list[str]] = defaultdict(list)
-    draft_block_size = mla_specs[mla_names[0]].block_size
-    for name, spec in sliding_specs.items():
-        spec = replace(spec, block_size=draft_block_size)
-        if spec.page_size_bytes > mla_page:
-            return None
-        sliding_buckets[replace(spec, page_size_padded=mla_page)].append(name)
+    # table over the same physical page, with the page padded to one MLA
+    # slot. The draft block size was already shrunk above so the page fits.
     spec_config = vllm_config.speculative_config
     drop_draft_block = spec_config is not None and spec_config.use_eagle_block_drop()
     sliding_groups: list[KVCacheGroupSpec] = []

@@ -12,6 +12,7 @@ KV-groups semantics rewritten against vLLM PR #55423 Part 2; the DCP
 KV-head replication path it relies on is #48392 (dfd9278229).
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -177,14 +178,100 @@ def test_mamba_groups_never_flagged_with_dflash_draft(caplog_vllm):
 
 
 def test_draft_page_too_wide_fails_fast():
-    # A draft page that cannot fit the MLA slot must not fall through to the
-    # generic promote path (which would silently break the kpool indexer's
-    # pool-page alignment); it must raise at grouping time.
+    # A draft whose per-token KV is wider than a whole MLA slot cannot join
+    # the slot-sharing layout at any block size (page width scales with block
+    # size), and must not fall through to the generic promote path (which
+    # would silently break the kpool indexer's pool-page alignment); it must
+    # raise at grouping time.
     spec = _glm5_target_spec()
-    spec.update(_dflash_draft_specs(head_size=4096))
+    # per-token = 96 heads * (4096+4096) * 2 bytes > the bf16 MLA slot page.
+    spec.update(_dflash_draft_specs(num_kv_heads=96, head_size=4096))
 
     with pytest.raises(ValueError, match="draft page does not fit"):
         get_kv_cache_groups(_grouping_config(), spec)
+
+
+def _fp8_ds_mla_target_spec() -> dict[str, KVCacheSpec]:
+    """Production layout: block 128, packed fp8 MLA (576 bytes/token)."""
+    spec: dict[str, KVCacheSpec] = {}
+    for i in range(12):
+        if i % 4 == 3:
+            spec[f"layers.{i}.attn"] = MLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=512,
+                head_size_v=64,
+                dtype=torch.uint8,
+            )
+            spec[f"layers.{i}.indexer"] = MLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=8,
+                head_size_v=8,
+                dtype=torch.uint8,
+                tokens_per_state=16,
+            )
+        else:
+            spec[f"layers.{i}.linear_attn"] = MambaSpec(
+                block_size=128,
+                shapes=((2, 128), (3, 32, 32)),
+                dtypes=(torch.float32, torch.float32),
+                num_speculative_blocks=2,
+            )
+    return spec
+
+
+def test_fp8_ds_mla_block128_draft_groups_join():
+    # block-size=128 + fp8_ds_mla (576 B/token target slot) + a Qwen3-shaped
+    # draft (8 kv heads, head_dim 128, bf16 -> 4096 B/token): the draft page
+    # at the target block is 8x the MLA slot, so the draft block is shrunk to
+    # the largest divisor of 128 whose page fits one slot (16 tokens), then
+    # padded to the MLA page. No fail-fast ValueError.
+    spec = _fp8_ds_mla_target_spec()
+    draft = _dflash_draft_specs(
+        num_layers=5, sliding_window=2048, num_kv_heads=8, head_size=128
+    )
+    for name, draft_spec in draft.items():
+        draft[name] = replace(draft_spec, block_size=8)
+    spec.update(draft)
+
+    groups = get_kv_cache_groups(_grouping_config(), spec)
+    sliding = [g for g in groups if type(g.kv_cache_spec) is SlidingWindowSpec]
+    assert sliding
+    mla_page = spec["layers.3.attn"].page_size_bytes
+
+    draft_names = {name for g in sliding for name in g.layer_names}
+    assert draft_names == set(draft)
+    for group in sliding:
+        assert group.is_eagle_group
+        draft_spec = cast(SlidingWindowSpec, group.kv_cache_spec)
+        assert draft_spec.page_size_padded == mla_page
+        assert draft_spec.page_size_bytes == mla_page
+
+    layout = _glm5_next_tensor_layout(groups)
+    assert layout is not None
+    assert any(type(g.kv_cache_spec) is SlidingWindowSpec for g in layout[1])
+
+
+def test_fp8_ds_mla_block128_draft_block_alignment():
+    # The shrunk draft block must divide the target's block size (so the
+    # hybrid hash granularity, the GCD over groups, stays well-defined) and
+    # its unpadded page must fit inside the single MLA slot it is padded to.
+    spec = _fp8_ds_mla_target_spec()
+    spec.update(_dflash_draft_specs(num_kv_heads=8, head_size=128))
+    target_block_size = spec["layers.3.attn"].block_size
+    mla_page = spec["layers.3.attn"].page_size_bytes
+
+    groups = get_kv_cache_groups(_grouping_config(), spec)
+    for group in groups:
+        if type(group.kv_cache_spec) is not SlidingWindowSpec:
+            continue
+        draft_spec = cast(SlidingWindowSpec, group.kv_cache_spec)
+        assert target_block_size % draft_spec.block_size == 0
+        assert draft_spec.block_size < target_block_size
+        assert draft_spec.unpadded_page_size_bytes <= mla_page
+        assert draft_spec.page_size_bytes == mla_page
+        assert draft_spec.sliding_window == 2048
 
 
 def test_draft_specs_without_spec_decode_do_not_annotate():
