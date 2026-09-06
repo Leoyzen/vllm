@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
+from vllm import envs
 from vllm.config import LoadConfig
 from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
@@ -1523,6 +1524,32 @@ class SpeculativeConfig:
 
         if self.method != "dspark" and self.enable_adaptive_verification:
             raise ValueError("Adaptive verification only supported with DSpark")
+
+        # DFlash runs its own speculator loop; the fused multi-step draft
+        # decode hook (KPOOL_TAIL slot-mapping refresh on the sparse-MLA
+        # builders) is a mutually exclusive draft path. Fail fast in either
+        # direction so the hook registration is never half-initialized.
+        if self.method == "dflash" and envs.VLLM_ENABLE_FUSED_DRAFT_SPARSE_MLA:
+            raise ValueError(
+                "method='dflash' cannot be combined with "
+                "VLLM_ENABLE_FUSED_DRAFT_SPARSE_MLA=1: the DFlash speculator "
+                "drives draft decode itself, and the fused-draft "
+                "slot-mapping refresh hook expects the fused-draft path. "
+                "Unset the env var to run DFlash."
+            )
+        if (
+            self.method not in ("dflash", None)
+            and envs.VLLM_ENABLE_FUSED_DRAFT_SPARSE_MLA
+            and self.target_model_config is not None
+            and getattr(self.target_model_config.hf_config, "model_type", None)
+            == "glm5_next"
+        ):
+            raise ValueError(
+                "GLM-5.3-Flash fused-draft decode "
+                "(VLLM_ENABLE_FUSED_DRAFT_SPARSE_MLA=1) requires the "
+                f"fused-draft path, but method='{self.method}' routes draft "
+                "decode elsewhere. Use method='dflash' or unset the env var."
+            )
 
         return self
 
