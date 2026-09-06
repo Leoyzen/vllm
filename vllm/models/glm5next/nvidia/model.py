@@ -1027,7 +1027,11 @@ class Glm5NextForCausalLM(
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
+    Glm4vForConditionalGeneration,
+    HasInnerState,
+    IsHybrid,
+    MixtureOfExperts,
+    SupportsEagle3,
 ):
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
@@ -1104,20 +1108,11 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
-        # DFlash2 aux capture is only implemented for the text-only model
-        # (Glm5NextForCausalLM); the SupportsEagle3 interface is deliberately
-        # NOT declared on this wrapper, but fail explicitly in case a path
-        # reaches here with dflash enabled anyway.
-        if (
-            vllm_config.speculative_config is not None
-            and getattr(vllm_config.speculative_config, "use_dflash", lambda: False)()
-        ):
-            raise ValueError(
-                "DFlash speculative decoding is not supported with the "
-                "GLM-5.3-Flash multimodal wrapper "
-                "(Glm5NextForConditionalGeneration); use the text-only "
-                "Glm5NextForCausalLM architecture instead."
-            )
+        # DFlash2 aux capture delegates to the inner text model:
+        # SupportsEagle3's protocol methods unwrap this wrapper's
+        # ``language_model.model`` chain to the Glm5NextModel holder, and the
+        # inherited forward returns the inner (hidden_states, aux_list) tuple
+        # verbatim when capture layers are set.
 
         # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
         # so pipeline parallelism is gated off (consistent with the text-only

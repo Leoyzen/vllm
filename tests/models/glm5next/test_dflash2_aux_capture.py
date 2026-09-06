@@ -26,6 +26,7 @@ from vllm.models.glm5next.nvidia import model as glm5next_model
 from vllm.models.glm5next.nvidia.model import (
     Glm5NextDecoderLayer,
     Glm5NextForCausalLM,
+    Glm5NextForConditionalGeneration,
     Glm5NextModel,
 )
 
@@ -306,6 +307,10 @@ class TestCaptureReturnShape:
     def test_supports_eagle3_interface_flags(self):
         assert Glm5NextForCausalLM.supports_eagle3 is True
         assert Glm5NextForCausalLM.supports_aux_hidden_states_over_pp is False
+        # The multimodal wrapper delegates capture to the inner text model;
+        # the official GLM-5.3-Flash checkpoint ships this architecture, so
+        # dflash support requires it to declare the interface too.
+        assert Glm5NextForConditionalGeneration.supports_eagle3 is True
 
 
 # ---------------------------------------------------------------------------
