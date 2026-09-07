@@ -267,6 +267,11 @@ class W4AFP8MoEMethod(FusedMoEMethodBase):
         if ep_size > 1:
             from vllm.distributed.parallel_state import get_ep_group
 
+            # Weight loading leaves the caching allocator holding most of
+            # the reserved memory. The post-load all_reduce below is the
+            # first new NCCL collective and needs workspace via cuMemAlloc,
+            # which fails if nothing is freed back to the driver.
+            torch.accelerator.empty_cache()
             torch.distributed.all_reduce(
                 local_max,
                 op=torch.distributed.ReduceOp.MAX,
